@@ -1,4 +1,4 @@
-# RoboCup AI Camera — Demo Build
+# RoboCup AI Camera - Demonstration Software Stack
 
 ![AI Cam Hardware](./assets/aicam-hardware.png "AICam hardware")
 
