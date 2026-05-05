@@ -1,0 +1,14 @@
+[Unit]
+Description=AICam ZMQ Broker
+After=network.target
+
+[Service]
+Type=simple
+User={{TARGET_USER}}
+WorkingDirectory={{DEPLOY_PATH}}
+ExecStart={{DEPLOY_PATH}}/.venv/bin/python -c "from apps.bus.broker import Broker; import signal,time; b=Broker(); b.start_background(); signal.signal(signal.SIGTERM, lambda *_: exit(0)); [time.sleep(1) for _ in iter(int,1)]"
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

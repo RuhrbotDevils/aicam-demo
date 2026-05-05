@@ -1,0 +1,15 @@
+{
+    "display_name": "RoboCup Landmarks 1920x1088 - YOLO26s (CPU)",
+    "id": "landmarks_1920_yolo26s_cpu",
+    "scope": "object_detection",
+    "active": true,
+    "runtime": "pytorch",
+    "input": {
+        "width": 1088,
+        "height": 1920,
+        "format": "RGB"
+    },
+    "model_path": "models/landmarks_1920_yolo26s.pt",
+    "notes": "RoboCup field-landmark detector so users can preview landmark detections (X-, T-, L-intersections, goal posts, center- and penalty-marks). Runs on CPU via Ultralytics - slow. The model emits class IDs / labels from the .pt.",
+    "inference_fps": 1
+}

@@ -1,0 +1,26 @@
+{
+    "display_name": "COCO YOLO26m (Hailo-10H)",
+    "id": "yolo26m_coco_640",
+    "scope": "object_detection",
+    "active": true,
+    "input": {
+        "width": 640,
+        "height": 640,
+        "format": "RGB"
+    },
+    "hef_path": "/opt/robocup-ai-camera/models/coco_640_yolo26m.hef",
+    "postprocess": {
+        "so_path": "/opt/robocup-ai-camera/apps/hailo_postprocess/libyolo26_post.so",
+        "function_name": "yolo26",
+        "output_format": "yolo26"
+    },
+    "labels": "coco_80",
+    "class_map": {
+        "32": "ball",
+        "64": "ball",
+        "65": "ball",
+        "1": "human"
+    },
+    "notes": "Demo model from Hailo Model Zoo. 80 COCO classes. For Demonstration purposes, this model remaps COCO sports ball, laptop and mouse to ball and COCO class 1 (person) to human.",
+    "inference_fps": 3
+}

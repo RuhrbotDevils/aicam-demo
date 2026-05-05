@@ -1,0 +1,14 @@
+[Unit]
+Description=AICam Control API
+After=network.target
+
+[Service]
+Type=simple
+User={{TARGET_USER}}
+WorkingDirectory={{DEPLOY_PATH}}
+ExecStart={{DEPLOY_PATH}}/.venv/bin/python -m uvicorn apps.control_api.app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

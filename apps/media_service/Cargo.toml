@@ -1,0 +1,36 @@
+[package]
+name = "ai-cam-media-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = { version = "0.7", features = ["macros"] }
+chrono = "0.4"
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-pbutils = "0.23"
+gstreamer-video = "0.23"
+cairo-rs = "0.20"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+zmq = "0.10"
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[features]
+default = []
+# When enabled, the streaming branch uses a fakesink instead of
+# rtmpsink. Benchmark binaries are a deliberate build-time choice; the
+# default release build always streams to a real RTMP receiver.
+streaming_benchmark = []
+
+[dev-dependencies]
+http = "1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

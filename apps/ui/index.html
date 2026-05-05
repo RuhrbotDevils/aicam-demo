@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RoboCup AI Camera</title>
+    <link rel="icon" type="image/png" href="/static/img/favicon.png" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <nav id="sidebar">
+      <div class="nav-header">
+        <div class="nav-logos">
+          <img src="/static/img/tu-dortmund.png" alt="TU Dortmund" class="nav-logo" />
+          <img src="/static/img/ruhrbotdevils.png" alt="RuhrbotDevils" class="nav-logo" />
+        </div>
+        <span class="nav-title">AICam</span>
+      </div>
+      <a href="#dashboard" class="nav-link active" data-page="dashboard" data-icon="&#9633;">Dashboard</a>
+      <a href="#detection" class="nav-link" data-page="detection" data-icon="&#9041;">Object Detection</a>
+      <a href="#recording" class="nav-link" data-page="recording" data-icon="&#9679;">Recording</a>
+      <a href="#playback" class="nav-link" data-page="playback" data-icon="&#9198;">Playback</a>
+      <a href="#streaming" class="nav-link" data-page="streaming" data-icon="&#9656;">Streaming</a>
+      <a href="#config" class="nav-link" data-page="config" data-icon="&#9881;">Configuration</a>
+    </nav>
+    <main id="content">
+      <div id="page-container">
+        <div class="loading">Loading...</div>
+      </div>
+    </main>
+    <div id="notification" class="notification hidden"></div>
+    <script src="/static/api.js"></script>
+    <script src="/static/magnifier.js"></script>
+    <script src="/static/pages/dashboard.js"></script>
+    <script src="/static/pages/recording.js"></script>
+    <script src="/static/pages/detection.js"></script>
+    <script src="/static/pages/streaming.js"></script>
+    <script src="/static/pages/playback.js"></script>
+    <script src="/static/pages/config.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

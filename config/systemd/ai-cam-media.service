@@ -1,0 +1,16 @@
+[Unit]
+Description=AICam Media Service
+After=network.target
+
+[Service]
+Type=simple
+User={{TARGET_USER}}
+WorkingDirectory={{DEPLOY_PATH}}
+ExecStart={{DEPLOY_PATH}}/apps/media_service/target/release/ai-cam-media-service
+# need 2s sleep to prevent HAILO_OUT_OF_PHYSICAL_DEVICES on restart.
+ExecStopPost=/bin/sleep 2
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

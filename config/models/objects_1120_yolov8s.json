@@ -1,0 +1,22 @@
+{
+    "display_name": "RoboCup HSL Objects 1120x640 YOLOv8s (Hailo-10H)",
+    "id": "yolov8s_rc_1120",
+    "scope": "object_detection",
+    "active": true,
+    "input": {
+        "width": 1120,
+        "height": 640,
+        "format": "RGB"
+    },
+    "hef_path": "/opt/robocup-ai-camera/models/objects_1120_yolov8s.hef",
+    "postprocess": {
+        "output_format": "yolov8"
+    },
+    "labels": [
+        "ball",
+        "robot",
+        "human"
+    ],
+    "notes": "RoboCup trained model, 3 Classes: Ball, Robot, Human.",
+    "inference_fps": 3
+}

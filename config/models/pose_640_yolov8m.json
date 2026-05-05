@@ -1,0 +1,21 @@
+{
+    "display_name": "Pose Estimation YOLOv8m (Hailo-10H)",
+    "id": "yolov8m_pose_640",
+    "scope": "object_detection",
+    "active": true,
+    "input": {
+        "width": 640,
+        "height": 640,
+        "format": "RGB"
+    },
+    "hef_path": "/usr/share/hailo-models/yolov8m_pose_h10.hef",
+    "postprocess": {
+        "so_path": "/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libyolov8pose_post.so",
+        "function_name": "filter",
+        "output_format": "custom"
+    },
+    "labels": "coco_17",
+    "notes": "Pose estimation from Hailo Model Zoo (yolov8m_pose). PERSON BOUNDING BOXES ONLY: the skeleton (joints + connecting lines) does NOT render in this demo release due to Hailo-Model-Zoo internal version mismatch.",
+    "inference_fps": 30,
+    "publish_detections": false
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=AICam CPU Object Detector (PyTorch inference — testing/development)
+After=ai-cam-zmq-broker.service ai-cam-media.service
+Wants=ai-cam-zmq-broker.service
+
+[Service]
+Type=simple
+User={{TARGET_USER}}
+WorkingDirectory={{DEPLOY_PATH}}
+# Only runs when features.cpu_detection is enabled in config.yaml.
+# Checks the config and exits if disabled.
+ExecStart={{DEPLOY_PATH}}/.venv/bin/python -m apps.ai_worker.cpu_detector
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

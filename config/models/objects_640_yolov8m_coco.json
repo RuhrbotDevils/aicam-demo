@@ -1,0 +1,24 @@
+{
+    "display_name": "COCO YOLOv8m (Hailo-10H)",
+    "id": "yolov8m_coco_640",
+    "scope": "object_detection",
+    "active": true,
+    "input": {
+        "width": 640,
+        "height": 640,
+        "format": "RGB"
+    },
+    "hef_path": "/opt/robocup-ai-camera/models/coco_640_yolo8m.hef",
+    "postprocess": {
+        "output_format": "yolov8"
+    },
+    "labels": "coco_80",
+    "class_map": {
+        "32": "ball",
+        "64": "ball",
+        "65": "ball",
+        "1": "human"
+    },
+    "notes": "Demo model from Hailo Model Zoo. 80 COCO classes, NMS. For Demonstration purposes, this model remaps COCO sports ball, laptop and mouse to ball and COCO class 1 (person) to human.",
+    "inference_fps": 3
+}
