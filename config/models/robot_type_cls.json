@@ -1,0 +1,19 @@
+{
+    "display_name": "Robot Type Classifier (Hailo-10H)",
+    "id": "robot_type_cls",
+    "scope": "object_detection",
+    "active": false,
+    "input": {
+        "width": 224,
+        "height": 224,
+        "format": "RGB"
+    },
+    "hef_path": "/opt/robocup-ai-camera/models/robot_type_cls.hef",
+    "postprocess": {
+        "so_path": "/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libclassification.so",
+        "function_name": "filter",
+        "output_format": "custom"
+    },
+    "notes": "Robot-type classifier HEF, shipped under config/models/ for cascade-classifier work. active=false in v1.0 - see jersey_color_cls.json for the rationale.",
+    "inference_fps": 0
+}

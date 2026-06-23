@@ -1,0 +1,64 @@
+[package]
+name = "aicam_broadcast_overlay"
+version = "0.1.0"
+edition = "2021"
+description = "NV12-native broadcast overlay (scoreboard + HUD) and GStreamer plugin for AICam streaming"
+
+[lib]
+# lib - used by the test binary + future programmatic callers.
+# cdylib - built as `libaicam_broadcast_overlay.so` and loaded by
+# GStreamer via GST_PLUGIN_PATH at runtime.
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+# Renderer + commands + layout work on their own - no GStreamer dep
+# at the lib boundary. The plugin module behind a cargo feature pulls
+# GStreamer in only when we need to build the .so.
+anyhow = "1"
+tracing = "0.1"
+
+# `ScoreboardState` / `PenaltyTile` / `Rgba` derive serde so the
+# plugin's `scoreboard-state-json` GObject property can ferry full
+# state across the cdylib <-> main-binary boundary. See the docstring
+# on `layout::ScoreboardState` for why we can't share the typed
+# `Arc<RwLock<…>>` directly between the two.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# FreeType binding for glyph rasterization. We rasterize once per
+# (font, size, style, codepoint) into 8-bit alpha masks and compose
+# strings each frame from the cache.
+# Links to system libfreetype6 (already installed via fontconfig /
+# cairo on every target box we deploy to).
+freetype-rs = "0.36"
+
+# Used by `plugin::test_pattern_state` so `show-test-overlay=true`
+# renders the live wall-clock in the top-right pill - same look as
+# production where media_service drives `clock_text` from
+# `chrono::Local::now()`. Default-features off keeps the compiled
+# `.so` size in check.
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+
+# Reuse media_service's pin for cross-crate ABI compatibility once we
+# enable the `plugin` feature (Jetson is locked to GStreamer 1.20).
+# Renamed to the conventional short `gst*` import names that
+# gst-plugins-rs and the gstreamer-rs docs use throughout.
+gst = { package = "gstreamer", version = "0.23", optional = true }
+gst-base = { package = "gstreamer-base", version = "0.23", optional = true }
+gst-video = { package = "gstreamer-video", version = "0.23", optional = true }
+
+[features]
+default = ["plugin"]
+plugin = ["dep:gst", "dep:gst-base", "dep:gst-video", "dep:chrono"]
+
+[[bench]]
+name = "fill_rect"
+harness = false
+
+[[bench]]
+name = "text"
+harness = false
+
+[[bench]]
+name = "scoreboard"
+harness = false

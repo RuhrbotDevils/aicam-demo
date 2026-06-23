@@ -1,0 +1,10 @@
+# Allow the control_api user to re-apply the inbound firewall on
+# config-PUT without a password prompt.
+#
+# The script reads only its own repo-deployed copy of
+# apps.control_api.app.firewall and shells out to `nft -f` on the
+# rendered ruleset. {{TARGET_USER}} is substituted by the setup
+# script - only that user gets the grant, and only for this exact
+# script path. Installed as /etc/sudoers.d/aicam-firewall.
+{{TARGET_USER}} ALL=(root) NOPASSWD: {{DEPLOY_PATH}}/.venv/bin/python {{DEPLOY_PATH}}/scripts/apply_firewall_rules.py
+{{TARGET_USER}} ALL=(root) NOPASSWD: /usr/bin/python3 {{DEPLOY_PATH}}/scripts/apply_firewall_rules.py

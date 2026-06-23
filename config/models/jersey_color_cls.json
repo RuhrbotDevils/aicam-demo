@@ -1,0 +1,19 @@
+{
+    "display_name": "Jersey Color Classifier (Hailo-10H)",
+    "id": "jersey_color_cls",
+    "scope": "object_detection",
+    "active": false,
+    "input": {
+        "width": 224,
+        "height": 224,
+        "format": "RGB"
+    },
+    "hef_path": "/opt/robocup-ai-camera/models/jersey_color_cls.hef",
+    "postprocess": {
+        "so_path": "/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libclassification.so",
+        "function_name": "filter",
+        "output_format": "custom"
+    },
+    "notes": "Jersey-colour classifier HEF, shipped under config/models/ for cascade-classifier work. active=false in v1.0 - the cascade pipeline (hailocropper -> hailoaggregator -> classifier) was removed, so a stand-alone classifier on a full camera frame produces no useful preview. Kept in the registry so a future task can wire it into a re-introduced cascade or a dedicated classifier scope.",
+    "inference_fps": 0
+}
