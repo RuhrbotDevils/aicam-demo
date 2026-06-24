@@ -1,5 +1,5 @@
 [Unit]
-Description=AICam CPU Object Detector (PyTorch inference — testing/development)
+Description=AICam CPU Object Detector (PyTorch inference - testing/development)
 After=ai-cam-zmq-broker.service ai-cam-media.service
 Wants=ai-cam-zmq-broker.service
 

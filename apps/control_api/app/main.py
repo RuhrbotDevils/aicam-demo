@@ -9,6 +9,7 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -52,7 +53,12 @@ logger = logging.getLogger(__name__)
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _start_health_collector()
     _start_detections_collector()
+    _start_gc_test_source()
+    _start_recording_controller()
+    _start_game_state_cache_collector()
     yield
+    _stop_recording_controller()
+    _stop_gc_test_source()
 
 
 app = FastAPI(
@@ -98,6 +104,31 @@ _service_health_thread = None
 _latest_detections: dict[str, dict] = {}
 _latest_detections_lock = threading.Lock()
 _detections_collector_thread = None
+
+# Synthetic GameController test source. When
+# config.telemetry.gc_test_mode is true, lifespan spawns a background
+# thread that publishes random GC messages on telemetry.game_state +
+# telemetry.penalties at 1 Hz so the broadcast overlay renders with
+# realistic data even when no real GameController is on the wire.
+_gc_test_source: object | None = None
+_gc_test_thread: threading.Thread | None = None
+
+# GC-driven auto-recording controller. Subscribes to
+# telemetry.game_state and starts / stops recordings on match-phase
+# transitions. Always started; gates each event on
+# `cfg.video.recording.recording_mode == "automatic"` so flipping the
+# config takes effect on the next packet without a service restart.
+_recording_controller: object | None = None
+_recording_thread: threading.Thread | None = None
+
+# Lightweight ZMQ-driven cache for the latest GameController state,
+# exposed via /api/v1/game_state/current + /api/v1/penalties/current
+# for the streaming dashboard's HTML scoreboard. A small dedicated
+# cache subscriber keeps it fed.
+_game_state_cache: dict | None = None
+_penalties_cache: dict | None = None
+_game_state_cache_lock = threading.Lock()
+_game_state_cache_thread: threading.Thread | None = None
 # Stale-detection guard: if no message has arrived for this source
 # within the window, return [] so the preview doesn't draw boxes
 # from a backend that has stopped publishing (e.g. cpu_detector that
@@ -168,30 +199,230 @@ def _start_detections_collector() -> None:
     _detections_collector_thread.start()
 
 
+def _start_gc_test_source() -> None:
+    """Spawn the synthetic GameController test source if enabled.
+
+    Gated on ``config.telemetry.gc_test_mode``. Safe to call at
+    startup unconditionally - the function returns immediately when
+    the flag is false or the source is already running.
+    """
+    global _gc_test_source, _gc_test_thread  # noqa: PLW0603
+    if _gc_test_source is not None:
+        return
+    try:
+        cfg = config_store.load()
+    except Exception as e:
+        logger.warning("gc_test_source: failed to read config (%s)", e)
+        return
+    if not getattr(cfg.telemetry, "gc_test_mode", False):
+        return
+    try:
+        from apps.bus.publisher import Publisher
+        from apps.telemetry_service.source import TestSource
+
+        source = TestSource(publisher=Publisher())
+    except Exception as e:
+        logger.warning("gc_test_source: failed to construct (%s)", e)
+        return
+
+    def _runner() -> None:
+        try:
+            source.run()
+        except Exception as e:
+            logger.warning("gc_test_source: runner exited (%s)", e)
+
+    t = threading.Thread(target=_runner, name="gc-test-source", daemon=True)
+    t.start()
+    _gc_test_source = source
+    _gc_test_thread = t
+    logger.info("gc_test_source: started (telemetry.gc_test_mode=true)")
+
+
+def _stop_gc_test_source() -> None:
+    global _gc_test_source, _gc_test_thread  # noqa: PLW0603
+    if _gc_test_source is None:
+        return
+    try:
+        _gc_test_source.stop()  # type: ignore[attr-defined]
+    except Exception as e:
+        logger.warning("gc_test_source: stop failed (%s)", e)
+    if _gc_test_thread is not None:
+        _gc_test_thread.join(timeout=3)
+    _gc_test_source = None
+    _gc_test_thread = None
+
+
+def _start_recording_controller() -> None:
+    """Wire the GC-driven recording controller.
+
+    The controller is always started - it gates on
+    ``cfg.video.recording.recording_mode`` per event, so flipping the
+    config takes effect on the next packet without a restart.
+    """
+    global _recording_controller, _recording_thread  # noqa: PLW0603
+    if _recording_controller is not None:
+        return
+    try:
+        from apps.bus.subscriber import Subscriber
+
+        from .recording_controller import GC_TOPIC, start_controller_thread
+    except Exception as e:
+        logger.warning("recording_controller: import failed (%s)", e)
+        return
+
+    def _get_mode() -> str:
+        try:
+            return config_store.load().video.recording.recording_mode.value
+        except Exception:
+            return "manual"
+
+    try:
+        subscriber = Subscriber(topics=[GC_TOPIC])
+        controller, thread = start_controller_thread(
+            subscriber=subscriber,
+            media_client=media_client,
+            get_recording_mode=_get_mode,
+        )
+    except Exception as e:
+        logger.warning("recording_controller: failed to start (%s)", e)
+        return
+
+    _recording_controller = controller
+    _recording_thread = thread
+    logger.info("recording_controller: started, listening on %s", GC_TOPIC)
+
+
+def _stop_recording_controller() -> None:
+    global _recording_controller, _recording_thread  # noqa: PLW0603
+    if _recording_controller is None:
+        return
+    try:
+        _recording_controller.stop()  # type: ignore[attr-defined]
+    except Exception as e:
+        logger.warning("recording_controller: stop failed (%s)", e)
+    if _recording_thread is not None:
+        _recording_thread.join(timeout=3)
+    _recording_controller = None
+    _recording_thread = None
+
+
+def _start_game_state_cache_collector() -> None:
+    """Long-lived telemetry.game_state + telemetry.penalties
+    subscriber that caches the latest message for the UI scoreboard.
+
+    A small dedicated background thread caches the latest message for
+    the streaming dashboard's scoreboard.
+
+    Always started; gates nothing - if no GC is publishing, the
+    cache stays None and the endpoints return 204.
+    """
+    global _game_state_cache_thread  # noqa: PLW0603
+    if _game_state_cache_thread is not None:
+        return
+    try:
+        from apps.bus.subscriber import Subscriber
+    except Exception as e:
+        logger.warning("game_state_cache: import failed (%s)", e)
+        return
+
+    def _collect() -> None:
+        try:
+            sub = Subscriber(topics=["telemetry.game_state", "telemetry.penalties"])
+        except Exception as e:
+            logger.warning("game_state_cache: subscriber init failed (%s)", e)
+            return
+        while True:
+            try:
+                received = sub.receive(timeout_ms=1000)
+            except Exception as e:
+                logger.warning("game_state_cache: receive failed (%s)", e)
+                continue
+            if received is None:
+                continue
+            topic, payload = received
+            try:
+                data = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            global _game_state_cache, _penalties_cache  # noqa: PLW0603
+            with _game_state_cache_lock:
+                if topic == "telemetry.game_state":
+                    _game_state_cache = data
+                elif topic == "telemetry.penalties":
+                    _penalties_cache = data
+
+    _game_state_cache_thread = threading.Thread(
+        target=_collect, daemon=True, name="game-state-cache"
+    )
+    _game_state_cache_thread.start()
+
+
 @app.get("/api/v1/health", response_model=HealthResponse)
 def get_health() -> HealthResponse:
-    # Probe media service health instead of returning stub
-    media_status = ServiceStatus.stopped
+    """Roll-up health for the dashboard.
+
+    Inspects `/status` (the rich payload) rather than only the
+    `GET /health` liveness check, and flips `media_service` to
+    `error` for any of:
+
+    - `/status` unreachable
+    - `state == "error"`
+    - any `*_error` field non-null (`streaming_error`, `recording_error`,
+      `ai_error`, `frame_export_error`, `pipeline_error`)
+    - `camera_device is None`
+
+    Each condition adds a human-readable line to `issues` so the
+    dashboard can show the operator what's actually wrong.
+    """
+    issues: list[str] = []
+
+    # Liveness check first - if the process isn't reachable at all,
+    # no point inspecting /status.
+    media_alive = False
     try:
         resp = httpx.get(f"{media_client._base}/health", timeout=1.0)
-        if resp.status_code == 200:
-            media_status = ServiceStatus.running
+        media_alive = resp.status_code == 200
     except httpx.HTTPError:
+        media_alive = False
+
+    media_status = ServiceStatus.running
+    ai_status = ServiceStatus.stopped
+
+    if not media_alive:
         media_status = ServiceStatus.error
+        issues.append("media_service: not reachable on /health")
+    else:
+        try:
+            resp = httpx.get(f"{media_client._base}/status", timeout=1.0)
+            data = resp.json() if resp.status_code == 200 else {}
+        except (httpx.HTTPError, ValueError):
+            data = {}
+            media_status = ServiceStatus.error
+            issues.append("media_service: /status unreachable")
+
+        if data.get("hailo_available", False):
+            ai_status = ServiceStatus.running
+
+        if data.get("state") == "error":
+            media_status = ServiceStatus.error
+        if data.get("camera_device") is None:
+            media_status = ServiceStatus.error
+            issues.append("media_service: no camera detected")
+
+        for field in (
+            "pipeline_error",
+            "streaming_error",
+            "recording_error",
+            "ai_error",
+            "frame_export_error",
+        ):
+            err = data.get(field)
+            if err:
+                media_status = ServiceStatus.error
+                issues.append(f"media_service: {field} - {err}")
 
     # Telemetry listener runs inside this process (ZMQ broker thread)
     telemetry_status = ServiceStatus.running
-
-    # AI workers are systemd services - check if detection pipeline is active
-    ai_status = ServiceStatus.stopped
-    try:
-        resp = httpx.get(f"{media_client._base}/status", timeout=1.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("hailo_available", False):
-                ai_status = ServiceStatus.running
-    except httpx.HTTPError:
-        pass
 
     return HealthResponse(
         status=runtime.node_status,
@@ -201,6 +432,7 @@ def get_health() -> HealthResponse:
             "ai_accelerator": ai_status,
             "telemetry": telemetry_status,
         },
+        issues=issues,
     )
 
 
@@ -264,8 +496,70 @@ def get_config() -> AppConfig:
 
 @app.put("/api/v1/config", response_model=AppConfig)
 def put_config(config: AppConfig) -> AppConfig:
+    # Detect a change to the firewall allowlist and re-apply the
+    # nftables ruleset in a background thread so the operator's config
+    # edit takes effect without a redeploy. Compare against the
+    # pre-save value because save() may normalise - comparing
+    # post-save would always be a no-op.
+    prev_allowlist: str | None = None
+    try:
+        prev_allowlist = config_store.load().network.firewall.allowed_ip_ranges
+    except Exception:  # noqa: BLE001
+        # Initial save before a config.yaml exists, or a config that
+        # predates the firewall field. Treat as "always re-apply" so
+        # the new field's default takes effect.
+        prev_allowlist = None
     config_store.save(config)
+    new_allowlist = config.network.firewall.allowed_ip_ranges
+    if prev_allowlist != new_allowlist:
+        _spawn_firewall_apply(reason=f"PUT /api/v1/config: {prev_allowlist!r} -> {new_allowlist!r}")
     return config
+
+
+_FIREWALL_APPLY_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "apply_firewall_rules.py"
+
+
+def _spawn_firewall_apply(*, reason: str) -> None:
+    """Best-effort fire-and-forget nftables re-apply.
+
+    The apply script needs root (nft writes to /etc/nftables.d/ and
+    calls `nft -f`); in production the control_api is launched via
+    systemd with the required CAP_NET_ADMIN, and the unit's sudoers
+    drop-in lets it `sudo -n` the script without a password. In dev
+    / tests where we don't have that capability, the apply will
+    fail with a logged warning and the operator can re-run the
+    script manually.
+    """
+
+    def _run() -> None:
+        try:
+            if not _FIREWALL_APPLY_SCRIPT.exists():
+                logger.warning(
+                    "firewall apply requested (%s) but script %s missing",
+                    reason,
+                    _FIREWALL_APPLY_SCRIPT,
+                )
+                return
+            logger.info("firewall apply: %s", reason)
+            result = subprocess.run(  # noqa: S603
+                ["sudo", "-n", sys.executable, str(_FIREWALL_APPLY_SCRIPT)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "firewall apply failed (rc=%d): stderr=%s",
+                    result.returncode,
+                    result.stderr.strip()[-500:],
+                )
+            else:
+                logger.info("firewall apply succeeded")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("firewall apply errored: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +1176,34 @@ def get_object_detection_preview_frame():  # type: ignore[no-untyped-def]
 # ---------------------------------------------------------------------------
 
 
+def _build_effective_rtmp_url(rtmp_url: str, stream_key: str) -> str:
+    """Join the configured base URL and per-stream key.
+
+    Strips a trailing ``/`` from the base before joining so callers
+    don't need to remember whether they typed it. Returns ``rtmp_url``
+    unchanged when no key is configured (so a complete single-string
+    URL still works).
+    """
+    base = rtmp_url.rstrip("/") if rtmp_url else ""
+    if not stream_key:
+        return rtmp_url
+    return f"{base}/{stream_key}"
+
+
+def _mask_rtmp_url(rtmp_url: str, stream_key: str) -> str:
+    """Render the effective URL with the key masked for display.
+
+    When a key is configured, returns ``<base>/********`` so the UI
+    can show the operator where the stream is pointing without
+    echoing the secret. When no key is configured, returns the URL
+    unchanged (it carries no secret).
+    """
+    if not stream_key:
+        return rtmp_url
+    base = rtmp_url.rstrip("/") if rtmp_url else ""
+    return f"{base}/********"
+
+
 @app.post("/api/v1/streaming/start", response_model=None)
 async def start_streaming(request: Request):  # type: ignore[no-untyped-def]
     """Start streaming - uses the configured RTMP URL.
@@ -908,9 +1230,7 @@ async def start_streaming(request: Request):  # type: ignore[no-untyped-def]
                     status_code=400,
                     media_type="application/json",
                 )
-            url = sc.rtmp_url.rstrip("/")
-            if sc.stream_key:
-                url = f"{url}/{sc.stream_key}"
+            url = _build_effective_rtmp_url(sc.rtmp_url, sc.stream_key)
             # Pass the configured bitrate through so the media service
             # uses the user-tunable streaming bitrate (default 4000 kbps,
             # appropriate for 720p) instead of its internal
@@ -968,9 +1288,7 @@ def get_streaming_status():  # type: ignore[no-untyped-def]
     """
     cfg = config_store.load()
     sc = cfg.video.streaming
-    masked_url = sc.rtmp_url.rstrip("/")
-    if sc.stream_key:
-        masked_url = f"{masked_url}/{'*' * 8}"
+    masked_url = _mask_rtmp_url(sc.rtmp_url, sc.stream_key)
 
     out: dict[str, object] = {
         "streaming_enabled": False,
@@ -1277,6 +1595,43 @@ def _get_duration_secs(session_dir: Path) -> float | None:
     return None
 
 
+def _read_session_fps(session_dir: Path) -> int | None:
+    """Read the recording's captured framerate from session.json.
+
+    Used to pass `-framerate <fps>` to ffmpeg when muxing the raw
+    `video.h264` into mp4 so the container's framerate metadata
+    matches the actual capture rate. Without the hint ffmpeg
+    reads from the H.264 SPS, which JetPack 4.6's nvv4l2h264enc
+    writes as `25/1` regardless of input caps; the resulting mp4
+    then plays back slow on metadata-honouring players.
+
+    Returns the int fps when session.json has a sane positive
+    integer in `video_fps`; otherwise returns `None` and the
+    caller falls back to today's behaviour (no framerate flag).
+    """
+    session_json = session_dir / "session.json"
+    if not session_json.exists():
+        return None
+    try:
+        data = json.loads(session_json.read_text())
+    except (OSError, ValueError) as e:
+        _convert_logger.warning(
+            "failed to read %s, falling back to no -framerate hint: %s",
+            session_json,
+            e,
+        )
+        return None
+    fps = data.get("video_fps")
+    if not isinstance(fps, int) or fps <= 0 or fps > 240:
+        _convert_logger.warning(
+            "session.json video_fps=%r is not a sane positive int, "
+            "falling back to no -framerate hint",
+            fps,
+        )
+        return None
+    return fps
+
+
 def _run_ffmpeg_conversion(session_dir: Path, session_id: str) -> None:
     """Run ffmpeg in a background thread to mux H.264+FLAC into MP4."""
     try:
@@ -1292,11 +1647,40 @@ def _run_ffmpeg_conversion(session_dir: Path, session_id: str) -> None:
 
         duration = _get_duration_secs(session_dir)
 
+        # Pass `-framerate <fps>` immediately before `-i video.h264`
+        # so ffmpeg's raw-H.264 demuxer tags the output mp4's
+        # r_frame_rate with the actual capture rate instead of
+        # inheriting the H.264 SPS default (25/1 on JetPack 4.6's
+        # nvv4l2h264enc). Keeps `-c copy` so no re-encode happens.
+        # Reads the fps from session.json's `video_fps` field; falls
+        # back to no flag if missing / malformed.
+        video_fps = _read_session_fps(session_dir)
+        video_input: list[str] = []
+        if video_fps is not None:
+            video_input += ["-framerate", str(video_fps)]
+        video_input += ["-i", str(video_path)]
+
+        # -strict experimental is required to mux FLAC into
+        # MP4 on ffmpeg < 4.4 (the Jetson Nano ships ffmpeg 3.4.11
+        # with JetPack 4.6). Without it muxing fails with "flac in
+        # MP4 support is experimental, add '-strict -2' if you want
+        # to use it" and recording.mp4 is left as an empty file. The
+        # flag is a no-op on newer ffmpeg, so passing it unconditionally
+        # is safe and avoids version-sniffing.
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1"]
         if audio_path.exists() and audio_path.stat().st_size > 0:
-            cmd += ["-i", str(video_path), "-i", str(audio_path), "-c", "copy", str(output_path)]
+            cmd += [
+                *video_input,
+                "-i",
+                str(audio_path),
+                "-c",
+                "copy",
+                "-strict",
+                "experimental",
+                str(output_path),
+            ]
         else:
-            cmd += ["-i", str(video_path), "-c", "copy", str(output_path)]
+            cmd += [*video_input, "-c", "copy", str(output_path)]
 
         _convert_logger.info("Starting MP4 conversion: %s", " ".join(cmd))
         proc = subprocess.Popen(  # noqa: S603
@@ -1442,6 +1826,81 @@ async def events_ws(websocket: WebSocket) -> None:
         pass
     finally:
         broadcaster.disconnect(q)
+
+
+# ---------------------------------------------------------------------------
+# GameController-state cache endpoints for the streaming dashboard's
+# HTML scoreboard. The _start_game_state_cache_collector lifespan
+# thread keeps these fed.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/v1/game_state/current", response_model=None)
+def get_game_state_current() -> Response:
+    """Return the latest cached GameController state.
+
+    Returns the GameStateMessage as JSON, or 204 No Content if no
+    GC packet has been received since the cache was last reset.
+    """
+    with _game_state_cache_lock:
+        gs = _game_state_cache
+    if gs is None:
+        return Response(status_code=204)
+    return Response(content=json.dumps(gs), media_type="application/json")
+
+
+@app.get("/api/v1/penalties/current", response_model=None)
+def get_penalties_current() -> Response:
+    """Return the latest cached per-robot penalty snapshot.
+
+    Returns the PenaltiesMessage as JSON, or 204 No Content if the
+    listener hasn't published one yet.
+    """
+    with _game_state_cache_lock:
+        pen = _penalties_cache
+    if pen is None:
+        return Response(status_code=204)
+    return Response(content=json.dumps(pen), media_type="application/json")
+
+
+@app.get("/api/v1/teams", response_model=None)
+def get_teams():  # type: ignore[no-untyped-def]
+    """Return the team registry from ``config/teams.json``.
+
+    Format: ``[{"number": int, "name": str, "color": "#RRGGBB" | null}]``,
+    sorted by number. Used by the Streaming page canvas overlay to
+    resolve team names + jersey colours without re-implementing the
+    schema parse in JS. Mirrors the Rust ``load_teams_map`` in
+    ``apps/media_service/src/overlay.rs``.
+    """
+    from pathlib import Path as _Path
+
+    path = _Path("config/teams.json")
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    out: list[dict] = []
+    for k, v in raw.items():
+        try:
+            num = int(k)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, str):
+            out.append({"number": num, "name": v, "color": None})
+        elif isinstance(v, dict) and isinstance(v.get("name"), str):
+            color = v.get("color")
+            out.append(
+                {
+                    "number": num,
+                    "name": v["name"],
+                    "color": color if isinstance(color, str) else None,
+                }
+            )
+    out.sort(key=lambda t: t["number"])
+    return out
 
 
 @app.get("/api/v1/camera_preview/frame", response_model=None)

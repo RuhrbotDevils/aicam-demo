@@ -114,7 +114,10 @@ pub fn detect_audio() -> Option<AudioDevice> {
 /// Detect whether a Hailo AI accelerator is available.
 ///
 /// Requires BOTH the `hailonet` GStreamer plugin AND a physical Hailo
-/// device node (`/dev/hailo*`). 
+/// device node (`/dev/hailo*`). The plugin alone isn't enough: on Pis
+/// that have `hailo-all` installed but no accelerator plugged in, the
+/// plugin loads fine but transitioning hailonet to READY fails with
+/// `HAILO_OUT_OF_PHYSICAL_DEVICES(74)` and segfaults the pipeline.
 pub fn detect_hailo() -> bool {
     if gstreamer::init().is_err() {
         return false;

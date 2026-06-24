@@ -1,5 +1,5 @@
 {
-    "display_name": "Pose Estimation YOLOv8m (Hailo-10H)",
+    "display_name": "YOLOv8m Pose (Hailo-10H)",
     "id": "yolov8m_pose_640",
     "scope": "object_detection",
     "active": true,
@@ -15,7 +15,7 @@
         "output_format": "custom"
     },
     "labels": "coco_17",
-    "notes": "Pose estimation from Hailo Model Zoo (yolov8m_pose). PERSON BOUNDING BOXES ONLY: the skeleton (joints + connecting lines) does NOT render in this demo release due to Hailo-Model-Zoo internal version mismatch.",
+    "notes": "Pose estimation from Hailo Model Zoo (yolov8m_pose). PERSON BOUNDING BOXES ONLY in this build - the actual skeleton (joints + connecting lines) does NOT render. function_name MUST be `filter`, not `yolov8`: the .so's `yolov8(HailoROIPtr)` symbol returns std::pair<vector<KeyPt>, vector<PairPairs>>, not void; hailofilter calls the named entrypoint as `void(HailoROIPtr)`, so calling `yolov8` mismatches the AArch64 ABI return-slot pointer and corrupts the caller's stack. `filter` is the void wrapper at libyolov8pose_post.so:405 that delegates to yolov8 with the correct signature. Why no skeleton: hailooverlay's HAILO_LANDMARKS dispatch on hailo-tappas-core 5.1.0 renders nothing; AND the .so's UINT16 keypoint output from this HEF is not dequantized to valid bbox-relative coords (every keypoint comes back at confidence=0.00 with off-screen coordinates). Lifting per-detection landmarks to ROI top level, a custom OpenCV-backed poseoverlay plugin, and forcing hailonet output-format-type=float32/uint8 all confirmed the keypoint data is unusable. A working skeleton would require writing a YOLOv8-pose post-processor from scratch (DFL box regression + UINT16 keypoint dequant + NMS) - deferred. Boxes alone are still useful as a person-presence cue.",
     "inference_fps": 30,
     "publish_detections": false
 }

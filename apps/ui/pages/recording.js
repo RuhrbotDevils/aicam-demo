@@ -49,7 +49,7 @@ const RecordingPage = {
         </div>
         <div id="rec-name-field" class="form-group">
           <label for="rec-name-input">Recording name (optional)</label>
-          <input type="text" id="rec-name-input" placeholder="e.g. RuhrbotDevils_vs_BerlinUnited_half1"
+          <input type="text" id="rec-name-input" placeholder="e.g. BHuman_vs_HTWK_half1"
                  pattern="[a-zA-Z0-9 _-]*" maxlength="100">
           <span id="rec-name-error" class="field-error" style="display:none">
             Only letters, numbers, spaces, hyphens, and underscores allowed
@@ -64,7 +64,12 @@ const RecordingPage = {
     `;
     this._bindModeSelector();
     this._bindNameInput();
-    Magnifier.attach(document.getElementById('rec-camera-preview-box'));
+    // Guard against the magnifier widget not being loaded and against
+    // the tile being absent.
+    if (typeof Magnifier !== 'undefined') {
+      const tile = document.getElementById('rec-camera-preview-box');
+      if (tile) Magnifier.attach(tile);
+    }
     document.addEventListener('click', this._closeMenus);
     await this._loadMode();
     await this.refresh();
@@ -322,9 +327,10 @@ const RecordingPage = {
   async _fetchFrame() {
     const box = document.getElementById('rec-camera-preview-box');
     if (!box) return;
-    // The media service auto-starts the pipeline on init
-    // The 204-then-retry logic below handles the brief warmup window
-    // when the first frame_export buffer hasn't landed yet.
+    // The media service auto-starts the pipeline on init - there is
+    // no separate /camera_preview/start endpoint. The 204-then-retry
+    // logic below handles the brief warmup window when the first
+    // frame_export buffer hasn't landed yet.
     try {
       let resp = await fetch(`/api/v1/camera_preview/frame?t=${Date.now()}`);
       if (resp.status === 204) {
@@ -382,7 +388,10 @@ const RecordingPage = {
       const result = await API.post('/recording/start', Object.keys(body).length ? body : null);
       if (result.ok) {
         Notify.success('Recording started');
-        this._startTime = Date.now();
+        // _startTime is anchored from the server timestamp inside the
+        // next _refreshStatus tick, so don't self-anchor here - would
+        // briefly show ~0:00 even when the server reports a started_at
+        // a few ms earlier.
       } else {
         Notify.error(result.error || 'Failed to start recording');
       }

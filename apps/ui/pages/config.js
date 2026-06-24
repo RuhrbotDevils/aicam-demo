@@ -46,7 +46,14 @@ const ConfigPage = {
     // Feature flags are intentionally not surfaced here - they remain
     // in config.yaml for ops/automation but are not user-tunable from
     // the UI. Camera and audio defaults match the production hardware
-    // (1920x1080 @ 30 fps, alsa default device)
+    // (1920x1080 @ 30 fps, alsa default device); video source is
+    // implicitly driven by the Replay feature; feature flags are all
+    // expected to be on.
+    //
+    // Telemetry (GameController) and Deployment (Jetson platform)
+    // sections ARE surfaced - they're meaningful to flip at runtime
+    // per host (gc_test_mode for demos without a live GC;
+    // platform=jetson for the Jetson hardware target).
     el.innerHTML = `
       ${this._nodeSection()}
       ${this._objectDetectionModelSection()}
@@ -56,6 +63,11 @@ const ConfigPage = {
         this._field('video.recording.video_codec', 'Video Codec', this._config.video.recording.video_codec, 'text'),
         this._field('video.recording.audio_codec', 'Audio Codec', this._config.video.recording.audio_codec, 'text'),
         this._checkbox('video.recording.audio_enabled', 'Audio Enabled', this._config.video.recording.audio_enabled),
+        // GC-driven auto-recording. `automatic` makes the
+        // control_api recording_controller segment recordings by
+        // (team1, team2, match_phase) on telemetry.game_state events.
+        // Takes effect on the next GC packet - no restart needed.
+        this._select('video.recording.recording_mode', 'Recording Mode', this._config.video.recording.recording_mode || 'manual', ['manual', 'automatic']),
       ])}
       ${this._section('Streaming', [
         this._checkbox('video.streaming.enabled', 'Streaming Enabled', this._config.video.streaming.enabled),
@@ -67,6 +79,8 @@ const ConfigPage = {
       ${this._section('AI', [
         this._field('ai.accelerator', 'Accelerator', this._config.ai.accelerator, 'text'),
       ])}
+      ${this._telemetrySection()}
+      ${this._deploymentSection()}
       ${this._themeSection()}
       <div style="margin-top: 1rem; display: flex; gap: 0.5rem;">
         <button class="btn btn-primary" onclick="ConfigPage.save()">Save Configuration</button>
@@ -107,6 +121,67 @@ const ConfigPage = {
   _nodeSection() {
     return this._section('Node', [
       this._field('node.id', 'Node ID', this._config.node.id, 'text'),
+    ]);
+  },
+
+  /**
+   * Telemetry section - GameController port + test-mode toggle,
+   * backed by the apps/telemetry_service GC listener.
+   *
+   * `gc_test_mode: true` makes the control_api spawn a synthetic
+   * TestSource that publishes random GC packets at 1 Hz, so the
+   * cairo overlay renders against realistic data without a live GC
+   * on the LAN. Operators flipping this from the UI need to restart
+   * the control_api service to apply.
+   */
+  _telemetrySection() {
+    const t = this._config.telemetry || {};
+    return this._section('Telemetry (GameController)', [
+      this._field(
+        'telemetry.game_controller_port',
+        'GameController UDP Port',
+        t.game_controller_port ?? 3838,
+        'number',
+      ),
+      this._checkbox(
+        'telemetry.gc_test_mode',
+        'GC Test Mode (synthetic packets at 1 Hz when no live GC)',
+        !!t.gc_test_mode,
+      ),
+    ]);
+  },
+
+  /**
+   * Deployment section - per-host hardware platform selection.
+   * Normally pinned during install; the UI surfaces it so operators
+   * can verify what was written and (rarely) override per host
+   * without dropping to a shell.
+   *
+   * `platform: jetson` triggers normalize_for_platform on the
+   * control_api side, which force-disables CPU detection and nulls
+   * the Hailo model selection (no Hailo on Jetson Nano).
+   */
+  _deploymentSection() {
+    const d = this._config.deployment || {};
+    return this._section('Deployment (Hardware Platform)', [
+      this._select(
+        'deployment.platform',
+        'Platform',
+        d.platform || 'pi',
+        ['pi', 'jetson'],
+      ),
+      this._select(
+        'deployment.camera_backend',
+        'Camera Backend',
+        d.camera_backend || 'libcamera',
+        ['libcamera', 'nvargus', 'v4l2'],
+      ),
+      this._select(
+        'deployment.video_encoder',
+        'H.264 Encoder',
+        d.video_encoder || 'x264',
+        ['x264', 'nvv4l2_h264'],
+      ),
     ]);
   },
 

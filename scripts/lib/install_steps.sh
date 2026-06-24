@@ -2,12 +2,9 @@
 #
 # Sourced by:
 #   - scripts/install_locally.sh    (runs on the target host)
-#   - scripts/setup_pi_env.sh       (runs on the dev container, drives
-#                                    the install over SSH)
 #
 # Functions in this file assume they run ON THE TARGET HOST and operate
-# on the local filesystem. setup_pi_env.sh wraps each call in SSH; the
-# local installer just calls them directly.
+# on the local filesystem.
 #
 # All functions are idempotent. Most return 0 on success and non-zero
 # on failure; a few are pure data emitters (no return value).
@@ -63,6 +60,11 @@ AICAM_LEGACY_UNITS=(
 # these from the install root keeps those sidecars resolvable without
 # editing every JSON.
 AICAM_OPT_ROOT="/opt/robocup-ai-camera"
+
+# Extra GStreamer plugin dir. The NV12-native overlay plugin
+# (libaicam_broadcast_overlay.so) is installed here and prepended to
+# GST_PLUGIN_PATH via a systemd drop-in so the media service finds it.
+AICAM_EXTRA_PLUGINS_DIR="/opt/aicam-extra-plugins"
 
 # ---------------------------------------------------------------------------
 # Status tracking helpers
@@ -277,21 +279,25 @@ aicam_disable_legacy_units() {
 # aicam_setup_opt_symlinks DEPLOY_PATH - symlink /opt paths to the install
 # root if they don't already exist. Pre-existing real dirs / symlinks are
 # left intact so an older full-project install can coexist.
-aicam_setup_model_sidecars() {
+aicam_setup_opt_symlinks() {
     local deploy_path="$1"
-
-    for _sidecar_file in "$deploy_path"/config/models/*.json; do
-      aicam_render_sidecar "$_sidecar_file" "$deploy_path"
-    done
+    _aicam_link_if_absent "$AICAM_OPT_ROOT/models" "$deploy_path/models"
+    _aicam_link_if_absent \
+        "$AICAM_OPT_ROOT/apps/hailo_postprocess" \
+        "$deploy_path/apps/hailo_postprocess"
 }
 
-aicam_render_sidecar() {
-    local src="$1" deploy_path="$2"
-    sed \
-        -i "s|$AICAM_OPT_ROOT|$deploy_path|g" \
-        "$src"
+_aicam_link_if_absent() {
+    local opt_path="$1"
+    local target="$2"
+    if [ -e "$opt_path" ]; then
+        echo "    /opt path exists, leaving alone: $opt_path"
+        return 0
+    fi
+    sudo mkdir -p "$(dirname "$opt_path")"
+    sudo ln -sfn "$target" "$opt_path" \
+        && echo "    Symlinked: $opt_path -> $target"
 }
-
 
 # ---------------------------------------------------------------------------
 # Systemd unit installation
@@ -348,12 +354,12 @@ aicam_install_systemd_units() {
         sudo systemctl enable "$_unit_name" 2>/dev/null || true
     done
 
-    #echo "    Restarting installed services ..."
-    #for _unit in ai-cam-zmq-broker.service \
-    #             ai-cam-media.service \
-    #             ai-cam-control-api.service; do
-    #    sudo systemctl restart "$_unit" 2>/dev/null || true
-    #done
+    echo "    Restarting installed services ..."
+    for _unit in ai-cam-zmq-broker.service \
+                 ai-cam-media.service \
+                 ai-cam-control-api.service; do
+        sudo systemctl restart "$_unit" 2>/dev/null || true
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -376,6 +382,175 @@ aicam_bootstrap_config_yaml() {
         cp "$example" "$cfg"
     fi
     sed -i "s/^  id: .*/  id: $node_id/" "$cfg"
+}
+
+# ---------------------------------------------------------------------------
+# NV12-native overlay plugin (libaicam_broadcast_overlay.so)
+# ---------------------------------------------------------------------------
+
+# aicam_build_install_overlay_plugin DEPLOY_PATH - build the
+# broadcast_overlay crate from its own directory (default features ->
+# plugin ON; the media-service build links it with the plugin feature
+# OFF, so it produces no GStreamer entry point). Installs the cdylib
+# into AICAM_EXTRA_PLUGINS_DIR and drops a systemd snippet that prepends
+# that dir to GST_PLUGIN_PATH so the `aicamnv12overlay` element is
+# discoverable (the default video.streaming.overlay_renderer). The
+# streaming pipeline falls back to cairo when the plugin is absent, so
+# this is recoverable rather than fatal. Idempotent.
+# Returns 0 on success, 1 on failure, 2 when skipped.
+aicam_build_install_overlay_plugin() {
+    local deploy_path="$1"
+    local crate="$deploy_path/apps/broadcast_overlay"
+    local src="$crate/target/release/libaicam_broadcast_overlay.so"
+    local dst="$AICAM_EXTRA_PLUGINS_DIR/libaicam_broadcast_overlay.so"
+    local cargo
+    cargo="$(aicam_cargo_path)"
+    [ -n "$cargo" ] || return 2
+    [ -f "$crate/Cargo.toml" ] || return 2
+
+    if ! "$cargo" build --release --manifest-path "$crate/Cargo.toml"; then
+        return 1
+    fi
+    [ -f "$src" ] || return 1
+
+    sudo mkdir -p "$AICAM_EXTRA_PLUGINS_DIR"
+    sudo install -m 0644 "$src" "$dst"
+    sudo mkdir -p /etc/systemd/system/ai-cam-media.service.d
+    sudo tee /etc/systemd/system/ai-cam-media.service.d/aicam-plugins.conf > /dev/null <<'OVERRIDE'
+# Expose /opt/aicam-extra-plugins on GST_PLUGIN_PATH so
+# libaicam_broadcast_overlay.so (aicamnv12overlay) is loadable. The
+# distro plugin path is kept alongside so stock plugins still resolve.
+[Service]
+Environment="GST_PLUGIN_PATH=/opt/aicam-extra-plugins:/usr/lib/aarch64-linux-gnu/gstreamer-1.0"
+OVERRIDE
+    sudo systemctl daemon-reload 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Inbound firewall
+# ---------------------------------------------------------------------------
+
+# aicam_setup_firewall DEPLOY_PATH USER - install iptables-persistent
+# (so the ruleset survives reboot), install the sudoers drop-in that
+# lets the control_api user re-apply the firewall on config-PUT without
+# a password, then apply the current ruleset rendered from config.yaml.
+# Default config (allowed_ip_ranges "*") allows inbound TCP 22 + 8000
+# from anywhere and drops all other inbound. Idempotent.
+aicam_setup_firewall() {
+    local deploy_path="$1" target_user="$2"
+
+    if ! command -v iptables-restore > /dev/null 2>&1; then
+        echo "    Installing iptables-persistent ..."
+        echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | sudo debconf-set-selections
+        echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | sudo debconf-set-selections
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent || return 1
+    fi
+    sudo systemctl enable netfilter-persistent.service 2>/dev/null || true
+
+    local sudoers_src="$deploy_path/config/sudoers.d/aicam-firewall"
+    if [ -f "$sudoers_src" ]; then
+        sed -e "s|{{TARGET_USER}}|$target_user|g" \
+            -e "s|{{DEPLOY_PATH}}|$deploy_path|g" \
+            "$sudoers_src" \
+            | sudo tee /etc/sudoers.d/aicam-firewall > /dev/null
+        sudo chmod 0440 /etc/sudoers.d/aicam-firewall
+    fi
+
+    # Apply via the same Python renderer the control_api uses at runtime,
+    # so the deploy-time and runtime rulesets are identical.
+    ( cd "$deploy_path" && sudo "$deploy_path/.venv/bin/python3" scripts/apply_firewall_rules.py )
+}
+
+# ---------------------------------------------------------------------------
+# Desktop / kiosk integration (best-effort; no-ops on a headless box)
+# ---------------------------------------------------------------------------
+
+# aicam_setup_kiosk_autostart DEPLOY_PATH - auto-launch the kiosk browser
+# on desktop start (Pi OS Bookworm uses labwc). Returns 2 if run_kiosk.sh
+# is absent.
+aicam_setup_kiosk_autostart() {
+    local deploy_path="$1"
+    local kiosk="$deploy_path/scripts/run_kiosk.sh"
+    [ -f "$kiosk" ] || return 2
+    mkdir -p "$HOME/.config/labwc"
+    cat > "$HOME/.config/labwc/autostart" <<KIOSKEOF
+# AICam kiosk - auto-launch browser on desktop start
+$kiosk &
+KIOSKEOF
+    chmod +x "$HOME/.config/labwc/autostart"
+}
+
+# aicam_install_desktop_shortcut DEPLOY_PATH - drop a desktop launcher
+# that reopens the kiosk UI if the operator closes the browser. Returns 2
+# if run_kiosk.sh is absent.
+aicam_install_desktop_shortcut() {
+    local deploy_path="$1"
+    local kiosk="$deploy_path/scripts/run_kiosk.sh"
+    local icon="$deploy_path/assets/favicon.png"
+    [ -f "$kiosk" ] || return 2
+    mkdir -p "$HOME/Desktop"
+    cat > "$HOME/Desktop/aicam-kiosk.desktop" <<DESKTOPEOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AICam
+Comment=Reopen the AICam camera UI
+Exec=$kiosk
+Icon=$icon
+Terminal=false
+Categories=Network;
+DESKTOPEOF
+    chmod +x "$HOME/Desktop/aicam-kiosk.desktop"
+}
+
+# aicam_set_desktop_wallpaper DEPLOY_PATH - set the AICam background on
+# the Pi OS desktop (pcmanfm GTK, with a pcmanfm-qt fallback). Returns 2
+# if the background image is absent.
+aicam_set_desktop_wallpaper() {
+    local deploy_path="$1"
+    local bg="$deploy_path/assets/aicam-background.jpg"
+    [ -f "$bg" ] || return 2
+    local content="[Desktop Entry]
+Wallpaper=$bg
+WallpaperMode=stretch"
+    mkdir -p "$HOME/.config/pcmanfm/default"
+    for f in "$HOME"/.config/pcmanfm/default/desktop-items-*.conf; do
+        [ -f "$f" ] && printf '%s\n' "$content" > "$f"
+    done
+    printf '%s\n' "$content" > "$HOME/.config/pcmanfm/default/desktop-items-0.conf"
+    mkdir -p "$HOME/.config/pcmanfm-qt/default"
+    printf '%s\n' "$content" > "$HOME/.config/pcmanfm-qt/default/desktop-items-0.conf"
+}
+
+# ---------------------------------------------------------------------------
+# Kernel / firmware tuning + kiosk hygiene
+# ---------------------------------------------------------------------------
+
+# aicam_kernel_firmware_tuning - lower vm.swappiness to 10 and enable
+# full USB current (usb_max_current_enable=1) in the Pi firmware config,
+# which the Hailo-10H needs for its 1.2A draw. The config.txt edit is
+# skipped on non-Pi hosts. Idempotent.
+aicam_kernel_firmware_tuning() {
+    sudo sysctl -w vm.swappiness=10 > /dev/null 2>&1 || true
+    echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-aicam-swappiness.conf > /dev/null
+
+    local cfg=/boot/firmware/config.txt
+    if [ -f "$cfg" ]; then
+        if grep -qE '^usb_max_current_enable=' "$cfg"; then
+            sudo sed -i 's/^usb_max_current_enable=.*/usb_max_current_enable=1/' "$cfg"
+        else
+            echo 'usb_max_current_enable=1' | sudo tee -a "$cfg" > /dev/null
+        fi
+        echo "    usb_max_current_enable=1 (reboot required to take effect)"
+    fi
+}
+
+# aicam_clean_chromium_locks - remove stale Chromium singleton locks left
+# behind by a cloned SD card, which otherwise block the kiosk browser.
+aicam_clean_chromium_locks() {
+    rm -f "$HOME"/.config/chromium/SingletonLock \
+          "$HOME"/.config/chromium/SingletonSocket \
+          "$HOME"/.config/chromium/SingletonCookie 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------

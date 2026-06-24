@@ -23,11 +23,11 @@ use std::sync::{Arc, Mutex};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::overlay::OverlayState;
 use crate::pipeline::ResolvedModel;
-use crate::producer::{AUDIO_CHANNEL, VIDEO_CHANNEL};
+use crate::producer::{AUDIO_CHANNEL_RECORDING, AUDIO_CHANNEL_STREAMING, VIDEO_CHANNEL};
 
 /// Element name of the appsink that the existing `frame_export.rs`
 /// callback locates by name. Kept stable across the migration so the
@@ -125,6 +125,16 @@ pub struct StreamingConsumer {
     /// `spawn_streaming_flow_check` task in `main.rs` reads this to
     /// decide whether the session actually carried any payload.
     pub buffer_count: Arc<AtomicU64>,
+    /// When the streaming consumer was built with
+    /// `overlay_renderer = nv12_native`, this holds the live
+    /// `aicamnv12overlay` element so the state-update path can push
+    /// fresh `ScoreboardState` to it by setting the
+    /// `scoreboard-state-json` GObject property at 10 Hz. We never
+    /// downcast to the Rust `Nv12Overlay` type here - that would
+    /// register `AicamNv12Overlay` in glib's subclass table inside
+    /// the main binary, fatally colliding with the .so's prior
+    /// registration. `None` on the legacy cairo path.
+    pub nv12_overlay_element: Option<gst::Element>,
 }
 
 /// Build the **streaming** consumer pipeline.
@@ -133,8 +143,7 @@ pub struct StreamingConsumer {
 /// `/streaming/stop` the caller transitions the pipeline to `Null` and
 /// drops it. A fresh pipeline per session means a fresh `rtmpsink`
 /// instance per session - closes the documented cycle-N
-/// `rtmpsink` bug (`docs/gstreamer/pipeline-overview.md` § *Known
-/// limitation*).
+/// `rtmpsink` bug.
 ///
 /// Topology:
 /// ```text
@@ -150,7 +159,7 @@ pub struct StreamingConsumer {
 ///                                                         ├→ flvmux(streamable=true) → stream_sink
 ///                                                         │
 /// (when has_audio:)                                       │
-/// interaudiosrc(channel="aicam-audio-main")               │
+/// interaudiosrc(channel="aicam-audio-{rec,stream}")               │
 ///   → queue(audio_stream_queue, leaky=downstream, 2 s)    │
 ///   → voaacenc / avenc_aac → aacparse ──────────────────┘
 ///
@@ -166,18 +175,43 @@ pub struct StreamingConsumer {
 /// silently drop sessions that carry no audio FLV tags. When
 /// `has_audio` is `false` the chain feeds from an internal silent
 /// `audiotestsrc` so the FLV always carries audio tags.
+#[allow(clippy::too_many_arguments)]
 pub fn build_streaming_consumer_pipeline(
     rtmp_url: &str,
+    width: u32,
+    height: u32,
     stream_bitrate_kbps: u32,
     fps: u32,
     has_audio: bool,
     overlay_state: OverlayState,
+    video_encoder: VideoEncoder,
+    overlay_renderer: crate::OverlayRenderer,
 ) -> anyhow::Result<StreamingConsumer> {
     gst::init()?;
 
     let pipeline = gst::Pipeline::builder()
         .name("streaming_consumer_pipeline")
         .build();
+
+    // Resolve the overlay renderer once. If `nv12_native` was asked
+    // for but the `aicamnv12overlay` factory isn't loaded (e.g. the
+    // `.so` isn't on GST_PLUGIN_PATH on this host), log a warning and
+    // fall back to the legacy `cairo` chain so the stream still comes up.
+    let overlay_renderer = match overlay_renderer {
+        crate::OverlayRenderer::Nv12Native => {
+            if gst::ElementFactory::find("aicamnv12overlay").is_some() {
+                crate::OverlayRenderer::Nv12Native
+            } else {
+                warn!(
+                    "streaming consumer: overlay_renderer=nv12_native requested but \
+                     aicamnv12overlay factory not registered - falling back to cairo. \
+                     Install libaicam_broadcast_overlay.so on GST_PLUGIN_PATH."
+                );
+                crate::OverlayRenderer::Cairo
+            }
+        }
+        crate::OverlayRenderer::Cairo => crate::OverlayRenderer::Cairo,
+    };
 
     // --- video chain ---
     let intervideosrc = gst::ElementFactory::make("intervideosrc")
@@ -201,71 +235,134 @@ pub fn build_streaming_consumer_pipeline(
     stream_queue.set_property("max-size-buffers", 0u32);
     stream_queue.set_property("max-size-bytes", 0u32);
 
-    // Downscale to 1280×720 @ 15 fps BEFORE cairooverlay + x264enc.
-    // The Pi 5 can't sustain a second 1080p30 software encoder while
-    // the rest of the pipeline (camera, AI, recording) is also active.
-    // 720p / 15 fps drops per-second encoder work by ~4.5× compared to
-    // 1080p / 30 (resolution 2.25× × fps 2×). 720p / 15 is a
-    // reasonable YouTube/Twitch streaming default for an
-    // event-broadcast scoreboard view; picture quality on the platform
-    // side is unchanged for the typical viewer.
-    let stream_videoscale = gst::ElementFactory::make("videoscale")
-        .name("stream_videoscale")
-        .build()?;
-    let stream_videorate = gst::ElementFactory::make("videorate")
-        .name("stream_videorate")
-        .build()?;
-    // `skip-to-first=true` - don't emit any output buffer before the
-    // first real input arrives. With the default `false`, starting
-    // the streaming pipeline mid-service makes videorate pad its
-    // output schedule from the parent clock with duplicates of stale
-    // buffers, which freezes the streamed frame for the whole session.
-    stream_videorate.set_property("skip-to-first", true);
-    let stream_downscale_caps = gst::Caps::builder("video/x-raw")
-        .field("width", 1280i32)
-        .field("height", 720i32)
-        .field("framerate", gst::Fraction::new(15, 1))
-        .build();
-    let stream_downscale_capsfilter = gst::ElementFactory::make("capsfilter")
-        .name("stream_downscale_caps")
-        .property("caps", &stream_downscale_caps)
-        .build()?;
+    // Stream the camera's native resolution and configured fps. The
+    // NV12-native overlay (default on Pi) lets the streaming chain run
+    // directly on the camera's NV12 buffers with no colorspace
+    // round-trip, so no downscale is needed.
+    // Tegra VIC overlay-bracket on Jetson, CPU videoconvert on Pi.
+    //
+    // Pi (X264 path): cairooverlay needs `video/x-raw,format=BGRx`,
+    // so we bracket it with two CPU `videoconvert` calls (NV12 →
+    // BGRx for cairooverlay, BGRx → I420 for x264enc).
+    //
+    // Jetson (Nvv4l2H264 path): software `videoconvert` saturates
+    // a single A57 core (~25-35 ms/frame each at 1080p), caps the
+    // chain throughput, and back-pressures `stream_queue` so the
+    // ABR controller walks the encoder bitrate to the floor. We
+    // replace both `videoconvert` calls with Tegra VIC (`nvvidconv`)
+    // operations. JetPack 4.6's `nvvidconv` requires NVMM-resident
+    // input for the BGRx colorspace conversion, so the path is:
+    //
+    //   stream_queue (system NV12, W×H@fps)
+    //     → nvvidconv  (system NV12 → NVMM NV12; memory upload)
+    //     → capsfilter(NVMM NV12, W×H@fps)
+    //     → nvvidconv  (NVMM NV12 → system BGRx; conversion + download)
+    //     → capsfilter(system BGRx, W×H@fps)
+    //     → cairooverlay
+    //     → [the encoder chain's nvvidconv handles BGRx → NVMM NV12]
+    //     → nvv4l2h264enc
+    //
+    // VIC handles NV12↔BGRx at >100 fps on a dedicated unit, so
+    // per-frame CPU drops from ~30 ms to ~5-8 ms (just the
+    // cairooverlay draw).
+    //
+    // Dev container has neither nvvidconv nor nvv4l2h264enc; we fall
+    // back to CPU `videoconvert` so the streaming consumer still
+    // builds for unit tests.
+    // Two overlay paths.
+    //
+    //  * `OverlayRenderer::Cairo` - legacy: dual-`nvvidconv`
+    //    bracket on Jetson, two CPU `videoconvert` calls on Pi /
+    //    dev container, then `cairooverlay`.
+    //  * `OverlayRenderer::Nv12Native` - single `aicamnv12overlay`
+    //    element that writes directly into NV12 planes. Encoder
+    //    consumes NV12 straight from the overlay's src pad - no
+    //    BGRx detour, no NVMM upload to feed cairo.
+    let stream_pre_upload: Option<gst::Element>;
+    let stream_pre_upload_capsfilter: Option<gst::Element>;
+    let stream_pre_convert: Option<gst::Element>;
+    let stream_pre_capsfilter: Option<gst::Element>;
+    let stream_post_convert: Option<gst::Element>;
+    let stream_cairooverlay: Option<gst::Element>;
+    let stream_nv12overlay: Option<gst::Element>;
 
-    // cairooverlay needs video/x-raw,format=BGRx - wrap in videoconverts.
-    let stream_pre_convert = gst::ElementFactory::make("videoconvert")
-        .name("stream_pre_convert")
-        .build()?;
-    let stream_cairooverlay = gst::ElementFactory::make("cairooverlay")
-        .name("stream_cairooverlay")
-        .build()?;
-    let stream_post_convert = gst::ElementFactory::make("videoconvert")
-        .name("stream_post_convert")
-        .build()?;
+    if matches!(overlay_renderer, crate::OverlayRenderer::Nv12Native) {
+        stream_pre_upload = None;
+        stream_pre_upload_capsfilter = None;
+        stream_pre_convert = None;
+        stream_pre_capsfilter = None;
+        stream_post_convert = None;
+        stream_cairooverlay = None;
 
-    let stream_encoder = try_create_element("x264enc", "stream_encoder")
-        .inspect(|enc| {
-            enc.set_property_from_str("speed-preset", "ultrafast");
-            enc.set_property("threads", 1u32);
-            enc.set_property("bitrate", stream_bitrate_kbps);
-            enc.set_property("key-int-max", fps);
-            enc.set_property_from_str("tune", "zerolatency");
-            info!(
-                bitrate_kbps = stream_bitrate_kbps,
-                "streaming consumer: video encoder = x264enc"
+        let nv12 = try_create_element("aicamnv12overlay", "stream_nv12overlay")?;
+        nv12.set_property("enabled", true);
+        info!(
+            "streaming consumer: overlay = aicamnv12overlay (NV12-native, no colorspace bracket)"
+        );
+        stream_nv12overlay = Some(nv12);
+    } else {
+        stream_nv12overlay = None;
+        let use_nvvidconv = matches!(video_encoder, VideoEncoder::Nvv4l2H264)
+            && gst::ElementFactory::find("nvvidconv").is_some();
+        if use_nvvidconv {
+            let upload = try_create_element("nvvidconv", "stream_pre_upload")?;
+            let upload_caps = try_create_element("capsfilter", "stream_pre_upload_capsfilter")?;
+            upload_caps.set_property(
+                "caps",
+                &gst::Caps::from_str(&format!(
+                    "video/x-raw(memory:NVMM),format=NV12,width={width},height={height},framerate={fps}/1"
+                ))?,
             );
-        })
-        .or_else(|_| {
-            try_create_element("openh264enc", "stream_encoder").inspect(|enc| {
-                // openh264enc takes bitrate in bps, not kbps.
-                enc.set_property("bitrate", stream_bitrate_kbps * 1000);
-                info!("streaming consumer: video encoder = openh264enc (fallback)");
-            })
-        })?;
+            let convert = try_create_element("nvvidconv", "stream_pre_convert")?;
+            let convert_caps = try_create_element("capsfilter", "stream_pre_capsfilter")?;
+            convert_caps.set_property(
+                "caps",
+                &gst::Caps::from_str(&format!(
+                    "video/x-raw,format=BGRx,width={width},height={height},framerate={fps}/1"
+                ))?,
+            );
+            stream_pre_upload = Some(upload);
+            stream_pre_upload_capsfilter = Some(upload_caps);
+            stream_pre_convert = Some(convert);
+            stream_pre_capsfilter = Some(convert_caps);
+            // Encoder chain's own nvvidconv handles BGRx → NVMM NV12.
+            stream_post_convert = None;
+        } else {
+            stream_pre_upload = None;
+            stream_pre_upload_capsfilter = None;
+            stream_pre_convert = Some(try_create_element("videoconvert", "stream_pre_convert")?);
+            // Capsfilter to lock cairooverlay's expected BGRx;
+            // videoconvert handles it transparently otherwise.
+            let convert_caps = try_create_element("capsfilter", "stream_pre_capsfilter")?;
+            convert_caps.set_property("caps", &gst::Caps::from_str("video/x-raw,format=BGRx")?);
+            stream_pre_capsfilter = Some(convert_caps);
+            stream_post_convert = Some(try_create_element("videoconvert", "stream_post_convert")?);
+        }
+        stream_cairooverlay = Some(
+            gst::ElementFactory::make("cairooverlay")
+                .name("stream_cairooverlay")
+                .build()?,
+        );
+    }
+
+    // Per-encoder chain. X264 is `[x264enc]` (or
+    // `[openh264enc]` fallback); Nvv4l2H264 on real Jetson is
+    // `[nvvidconv, nvv4l2h264enc]` (degrades to x264 on dev
+    // container). threads=1 so a long encode pass doesn't starve
+    // the streaming session.
+    let stream_encoder_chain = build_h264_encoder_chain(
+        video_encoder,
+        "stream_",
+        stream_bitrate_kbps,
+        fps,
+        1,
+        H264EncodeMode::Cbr,
+    )?;
 
     let stream_h264parse = gst::ElementFactory::make("h264parse")
         .name("stream_h264parse")
         .build()?;
-    // config-interval=-1 inserts SPS/PPS with every IDR - required by
+    // config-interval=-1 inserts SPS/PPS with every IDR; required by
     // RTMP receivers (mediamtx) that expect AVCDecoderConfigurationRecord.
     stream_h264parse.set_property("config-interval", -1i32);
 
@@ -290,35 +387,63 @@ pub fn build_streaming_consumer_pipeline(
 
     let stream_sink = make_stream_sink(rtmp_url)?;
 
-    pipeline.add_many([
-        &intervideosrc,
-        &stream_queue,
-        &stream_videoscale,
-        &stream_videorate,
-        &stream_downscale_capsfilter,
-        &stream_pre_convert,
-        &stream_cairooverlay,
-        &stream_post_convert,
-        &stream_encoder,
-        &stream_h264parse,
-        &stream_avc_capsfilter,
-        &stream_flvmux,
-        &stream_sink,
-    ])?;
+    // Pin the input framerate so the encoder writes the
+    // configured fps into the H.264 SPS. Same reasoning as the
+    // recording consumer: without this capsfilter intervideosrc
+    // renegotiates downstream caps to the gst-plugins-bad default
+    // (25/1), the encoder tags the stream as 25 fps, and RTMP
+    // receivers that trust SPS timing mis-time playback. The
+    // PTS-derived rate is unchanged - metadata-only, no frames
+    // dropped or duplicated.
+    let stream_framerate_caps = gst::Caps::builder("video/x-raw")
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .build();
+    let stream_framerate_capsfilter = gst::ElementFactory::make("capsfilter")
+        .name("stream_framerate_caps")
+        .property("caps", &stream_framerate_caps)
+        .build()?;
 
-    gst::Element::link_many([
-        &intervideosrc,
-        &stream_queue,
-        &stream_videoscale,
-        &stream_videorate,
-        &stream_downscale_capsfilter,
-        &stream_pre_convert,
-        &stream_cairooverlay,
-        &stream_post_convert,
-        &stream_encoder,
-        &stream_h264parse,
-        &stream_avc_capsfilter,
-    ])?;
+    // Flat Vec so the variable-length encoder chain (1 element for
+    // X264, 2 for Nvv4l2H264) and the optional Jetson VIC
+    // overlay-bracket elements slot in without per-encoder special
+    // cases at the call site.
+    let mut video_chain: Vec<gst::Element> = vec![
+        intervideosrc.clone(),
+        stream_queue.clone(),
+        stream_framerate_capsfilter.clone(),
+    ];
+    if let Some(ref nv12) = stream_nv12overlay {
+        // NV12-native fast path: single element bridges
+        // downscale → encoder. No videoconvert / nvvidconv bracket.
+        video_chain.push(nv12.clone());
+    } else {
+        if let Some(ref upload) = stream_pre_upload {
+            video_chain.push(upload.clone());
+        }
+        if let Some(ref upload_caps) = stream_pre_upload_capsfilter {
+            video_chain.push(upload_caps.clone());
+        }
+        if let Some(ref pre) = stream_pre_convert {
+            video_chain.push(pre.clone());
+        }
+        if let Some(ref pre_caps) = stream_pre_capsfilter {
+            video_chain.push(pre_caps.clone());
+        }
+        if let Some(ref cairo) = stream_cairooverlay {
+            video_chain.push(cairo.clone());
+        }
+        if let Some(ref post) = stream_post_convert {
+            video_chain.push(post.clone());
+        }
+    }
+    video_chain.extend(stream_encoder_chain.iter().cloned());
+    video_chain.push(stream_h264parse.clone());
+    video_chain.push(stream_avc_capsfilter.clone());
+
+    pipeline.add_many(&video_chain)?;
+    pipeline.add_many([&stream_flvmux, &stream_sink])?;
+
+    gst::Element::link_many(&video_chain)?;
 
     let flvmux_video_pad = stream_flvmux
         .request_pad_simple("video")
@@ -340,7 +465,7 @@ pub fn build_streaming_consumer_pipeline(
     // stream - without it the receiver silently drops the connection.
     // Always produce an audio track:
     //   has_audio=true  → audio comes from the producer-side
-    //                     interaudiosink(channel="aicam-audio-main")
+    //                     interaudiosink(channel="aicam-audio-{rec,stream}")
     //                     via interaudiosrc here
     //   has_audio=false → an internal audiotestsrc(wave=silence) keeps
     //                     flvmux happy when no microphone is present
@@ -369,7 +494,11 @@ pub fn build_streaming_consumer_pipeline(
         let interaudiosrc = gst::ElementFactory::make("interaudiosrc")
             .name("stream_interaudiosrc")
             .build()?;
-        interaudiosrc.set_property("channel", AUDIO_CHANNEL);
+        // Read from the streaming-only audio channel. The
+        // producer tees its audio chain into two interaudiosinks
+        // (rec + stream) so the recording consumer's audio adapter
+        // isn't drained out from under it whenever streaming runs.
+        interaudiosrc.set_property("channel", AUDIO_CHANNEL_STREAMING);
         // do-timestamp=true: re-stamp at the streaming pipeline's clock,
         // matching intervideosrc above. Keeps A/V in sync on the consumer
         // side and gives flvmux/rtmpsink monotonically increasing PTS
@@ -383,7 +512,7 @@ pub fn build_streaming_consumer_pipeline(
             &audio_stream_aacparse,
         ])?;
         info!(
-            channel = AUDIO_CHANNEL,
+            channel = AUDIO_CHANNEL_STREAMING,
             "streaming consumer: audio chain via interaudiosrc → voaacenc/avenc_aac"
         );
     } else {
@@ -421,17 +550,25 @@ pub fn build_streaming_consumer_pipeline(
     let aacparse_src = audio_stream_aacparse.static_pad("src").unwrap();
     aacparse_src.link(&flvmux_audio_pad)?;
 
-    // --- cairooverlay draw signal ---
-    stream_cairooverlay.connect("draw", false, move |args| {
-        let cr: &cairo::Context = args[1].get().unwrap();
-        let element: gst::Element = args[0].get().unwrap();
-        let (width, height) = get_overlay_dimensions(&element);
-        if let Ok(data) = overlay_state.read() {
-            crate::overlay::draw_overlay(cr, width, height, &data);
-        }
-        None
-    });
-    info!("streaming consumer: cairooverlay draw signal connected");
+    // --- cairooverlay draw signal (only when the cairo path is
+    // selected; the NV12-native path drives its own state out-of-band
+    // via the `scoreboard-state-json` GObject property set on the
+    // `aicamnv12overlay` element by `start_streaming` at 10 Hz) ---
+    if let Some(ref cairo) = stream_cairooverlay {
+        let overlay_state = overlay_state.clone();
+        cairo.connect("draw", false, move |args| {
+            let cr: &cairo::Context = args[1].get().unwrap();
+            let element: gst::Element = args[0].get().unwrap();
+            let (width, height) = get_overlay_dimensions(&element);
+            if let Ok(data) = overlay_state.read() {
+                crate::overlay::draw_overlay(cr, width, height, &data);
+            }
+            None
+        });
+        info!("streaming consumer: cairooverlay draw signal connected");
+    }
+    // Quiet the unused-arg warning when we don't read overlay_state.
+    let _ = &overlay_state;
 
     // --- buffer-flow probe on stream_h264parse.src ---
     // Counts ENCODED VIDEO buffers only - the rate that the UI exposes as
@@ -462,6 +599,7 @@ pub fn build_streaming_consumer_pipeline(
     Ok(StreamingConsumer {
         pipeline,
         buffer_count,
+        nv12_overlay_element: stream_nv12overlay,
     })
 }
 
@@ -471,11 +609,10 @@ pub fn build_streaming_consumer_pipeline(
 /// back to `rtmp2sink` from `gst-plugins-bad` if librtmp is missing.
 /// The preference is opposite to what the element ranks suggest because
 /// `rtmp2sink` fails against mediamtx 1.x on live A+V with
-/// "received type 3 chunk without previous chunk"; reproduced outside
-/// `media_service` by `experiments/gst-launch-scratchpad/av_live_to_mediamtx.sh`.
+/// "received type 3 chunk without previous chunk".
 ///
 /// With the `streaming_benchmark` Cargo feature enabled the sink is
-/// `fakesink` so the smoke harness runs without an RTMP receiver.
+/// `fakesink` so the test harness runs without an RTMP receiver.
 fn make_stream_sink(rtmp_url: &str) -> anyhow::Result<gst::Element> {
     #[cfg(feature = "streaming_benchmark")]
     {
@@ -484,7 +621,7 @@ fn make_stream_sink(rtmp_url: &str) -> anyhow::Result<gst::Element> {
             .build()?;
         s.set_property("sync", false);
         s.set_property("async", false);
-        info!("streaming consumer: benchmark build - stream_sink = fakesink");
+        info!("streaming consumer: benchmark build, stream_sink = fakesink");
         let _ = rtmp_url;
         Ok(s)
     }
@@ -542,6 +679,212 @@ fn try_create_element(factory_name: &str, element_name: &str) -> anyhow::Result<
         .map_err(|e| anyhow::anyhow!("Failed to create element '{}': {}", factory_name, e))
 }
 
+/// Which H.264 encoder the recording + streaming consumers use.
+///
+/// `X264` is the current default (software encoder). `Nvv4l2H264` is
+/// the Jetson hardware encoder (NVENC) - requires NVMM-resident input,
+/// so the chain inserts an `nvvidconv` upload step before the encoder.
+/// When `nvv4l2h264enc` isn't registered (dev container) the chain
+/// falls back to `x264enc` so the pipeline still builds for unit tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncoder {
+    X264,
+    Nvv4l2H264,
+}
+
+impl VideoEncoder {
+    /// Parse the `deployment.video_encoder` string from `config.yaml`.
+    /// Unknown values warn and fall back to `X264` so a typo in the
+    /// deployment script doesn't take the box down - the pipeline still
+    /// builds against the (likely correct on Pi) software default.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "x264" => Self::X264,
+            "nvv4l2_h264" => Self::Nvv4l2H264,
+            other => {
+                warn!(
+                    value = %other,
+                    "VideoEncoder::parse: unknown value, falling back to x264"
+                );
+                Self::X264
+            }
+        }
+    }
+}
+
+/// Build the per-encoder element chain for the recording +
+/// streaming consumers.
+///
+/// `name_prefix` is `"stream_"` or `"rec_"` - produces an `<prefix>encoder`
+/// element name so the existing bus-error classifier and any
+/// name-based observability keep working.
+///
+/// Returns a `Vec<gst::Element>` in link order. For `X264` the chain is
+/// `[x264enc]` (or `[openh264enc]` on fallback). For `Nvv4l2H264` on a
+/// real Jetson the chain is `[nvvidconv, nvv4l2h264enc]` - the
+/// `nvvidconv` step is mandatory because `nvv4l2h264enc` only accepts
+/// NVMM-resident NV12, while the upstream `videoconvert` produces it
+/// in system memory. When `nvv4l2h264enc` is absent (dev container)
+/// the chain degrades to the x264 fallback.
+///
+/// `x264_threads` is the value for `x264enc.threads` (0 = auto). The
+/// recording consumer uses `0`, the streaming consumer uses `1` so a
+/// long encode pass doesn't starve the streaming session. Ignored
+/// for `nvv4l2h264enc`.
+///
+/// `mode` selects the H.264 rate-control strategy. See
+/// [`H264EncodeMode`] for the cross-platform semantics. Streaming
+/// always uses `Cbr` (bandwidth-cap matters for RTMP); recording on
+/// Jetson uses `ConstantQuality` (NVENC CBR on JP 4.6 underuses its
+/// bitrate budget for low-motion content and produces blocky
+/// recordings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264EncodeMode {
+    /// Constant bitrate. x264enc pads bits to fill the target so the
+    /// recording reliably comes out near the configured kbps. NVENC
+    /// on JP 4.6 emits "just enough" bits for its internal quality
+    /// target, which under low-motion content collapses to 200-300
+    /// kbps regardless of the configured ceiling - use `Cbr` only
+    /// when the wire bandwidth is the binding constraint (i.e.
+    /// streaming).
+    Cbr,
+    /// Constant-quantization. The encoder emits whatever bitrate is
+    /// needed to maintain `qp` per-frame quality. Bitrate floats -
+    /// high-motion sequences spike, idle scenes stay small.
+    /// `nvv4l2h264enc` enters this mode via
+    /// `ratecontrol-enable=false` + `quant-i/p/b-frames=qp` +
+    /// `preset-level=UltraFastPreset`. `x264enc` enters it via
+    /// `pass=qual`+`quantizer=qp`, but the demo's Pi recording path
+    /// uses Cbr anyway, so this variant is functionally
+    /// NVENC-specific for now.
+    ConstantQuality { qp: u32 },
+}
+
+fn build_h264_encoder_chain(
+    encoder: VideoEncoder,
+    name_prefix: &str,
+    bitrate_kbps: u32,
+    fps: u32,
+    x264_threads: u32,
+    mode: H264EncodeMode,
+) -> anyhow::Result<Vec<gst::Element>> {
+    let enc_name = format!("{name_prefix}encoder");
+    let nvconv_name = format!("{name_prefix}encoder_upload");
+
+    let build_x264_chain = || -> anyhow::Result<Vec<gst::Element>> {
+        let enc = try_create_element("x264enc", &enc_name)
+            .inspect(|enc| {
+                enc.set_property_from_str("speed-preset", "ultrafast");
+                enc.set_property_from_str("tune", "zerolatency");
+                enc.set_property("threads", x264_threads);
+                enc.set_property("bitrate", bitrate_kbps);
+                enc.set_property("key-int-max", fps);
+                info!(
+                    name = %enc_name,
+                    bitrate_kbps,
+                    threads = x264_threads,
+                    "h264 encoder = x264enc"
+                );
+            })
+            .or_else(|_| {
+                try_create_element("openh264enc", &enc_name).inspect(|enc| {
+                    // openh264enc takes bitrate in bps, not kbps.
+                    enc.set_property("bitrate", bitrate_kbps * 1000);
+                    info!(
+                        name = %enc_name,
+                        bitrate_kbps,
+                        "h264 encoder = openh264enc (x264enc fallback)"
+                    );
+                })
+            })?;
+        Ok(vec![enc])
+    };
+
+    match encoder {
+        VideoEncoder::X264 => build_x264_chain(),
+        VideoEncoder::Nvv4l2H264 => {
+            // Real Jetson: nvvidconv (upload NV12 to NVMM) →
+            // nvv4l2h264enc. Property block differs from x264: bitrate
+            // in bps (not kbps), iframeinterval / control-rate /
+            // insert-sps-pps; none of x264's speed-preset / tune /
+            // threads apply.
+            if let Ok(enc) = try_create_element("nvv4l2h264enc", &enc_name) {
+                // Common properties shared by both rate-control modes.
+                enc.set_property("iframeinterval", fps.max(2) / 2);
+                enc.set_property("idrinterval", fps);
+                enc.set_property("insert-sps-pps", true);
+                enc.set_property("maxperf-enable", true);
+                enc.set_property_from_str("profile", "Main");
+
+                match mode {
+                    H264EncodeMode::Cbr => {
+                        // Streaming use-case: wire bandwidth is the
+                        // binding constraint, so cap the bitrate at
+                        // the configured value. The vbv-size /
+                        // peak-bitrate hardening tightens the
+                        // rate-controller's behaviour but cannot
+                        // override NVENC's content-adaptive
+                        // bit-allocation - low-motion content will
+                        // still under-spend, which is why recording
+                        // uses ConstantQuality instead.
+                        enc.set_property("bitrate", bitrate_kbps * 1000);
+                        enc.set_property_from_str("control-rate", "constant_bitrate");
+                        enc.set_property("vbv-size", bitrate_kbps * 1000);
+                        enc.set_property("peak-bitrate", bitrate_kbps * 1500);
+                        info!(
+                            name = %enc_name,
+                            mode = "CBR",
+                            bitrate_kbps,
+                            iframeinterval = fps.max(2) / 2,
+                            "h264 encoder = nvv4l2h264enc (Jetson NVENC)"
+                        );
+                    }
+                    H264EncodeMode::ConstantQuality { qp } => {
+                        // NVENC CBR on JP 4.6 emits
+                        // ~200-300 kbps for low-motion content even
+                        // when bitrate=8000000 is set (blocky
+                        // "upscaled" recordings). CQP mode (per-frame
+                        // quantization parameter) guarantees a quality
+                        // floor regardless of motion; the encoder
+                        // emits whatever bitrate is needed to maintain
+                        // QP=qp. Suitable for recording (local SD,
+                        // quality > bandwidth); NOT for streaming
+                        // (bitrate floats; high-motion sequences
+                        // spike).
+                        //
+                        // `ratecontrol-enable=false` disables the
+                        // rate-controller. `preset-level=UltraFastPreset`
+                        // is required per Tegra docs when the
+                        // rate-controller is off. The `quant-*-frames`
+                        // properties are ignored unless both of the
+                        // above are set.
+                        enc.set_property("ratecontrol-enable", false);
+                        enc.set_property_from_str("preset-level", "UltraFastPreset");
+                        enc.set_property("quant-i-frames", qp);
+                        enc.set_property("quant-p-frames", qp);
+                        enc.set_property("quant-b-frames", qp);
+                        info!(
+                            name = %enc_name,
+                            mode = "CQP",
+                            qp,
+                            iframeinterval = fps.max(2) / 2,
+                            "h264 encoder = nvv4l2h264enc (Jetson NVENC)"
+                        );
+                    }
+                }
+                let nvconv = try_create_element("nvvidconv", &nvconv_name)?;
+                Ok(vec![nvconv, enc])
+            } else {
+                warn!(
+                    name = %enc_name,
+                    "nvv4l2h264enc unavailable, falling back to x264enc"
+                );
+                build_x264_chain()
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Recording consumers
 // ---------------------------------------------------------------------------
@@ -563,7 +906,7 @@ pub struct RecordingVideoConsumer {
     pub videoconvert: gst::Element,
     pub encoder: gst::Element,
     pub filesink: gst::Element,
-    /// Buffer counter on `encoder.sink` - reset by `start_recording`,
+    /// Buffer counter on `encoder.sink`, reset by `start_recording`,
     /// consumed by both `RecordingStats` (file frame count) and the
     /// grace-period flow check (silent-failure detection).
     pub frame_count: Arc<AtomicU64>,
@@ -604,11 +947,13 @@ pub struct RecordingAudioConsumer {
 /// Element names are kept identical to the legacy tee branch
 /// (`rec_valve`, `rec_queue`, `rec_videoconvert`, `rec_encoder`,
 /// `rec_filesink`) so any element-by-name lookups in `pipeline.rs`,
-/// the bus watch's recording error classifier, and the smoke
+/// the bus watch's recording error classifier, and the test
 /// harness keep working.
 pub fn build_recording_video_consumer_pipeline(
     fps: u32,
     bitrate_kbps: u32,
+    video_encoder: VideoEncoder,
+    encoder_quality_qp: u32,
 ) -> anyhow::Result<RecordingVideoConsumer> {
     gst::init()?;
 
@@ -645,20 +990,44 @@ pub fn build_recording_video_consumer_pipeline(
         .name("rec_videoconvert")
         .build()?;
 
-    let encoder = try_create_element("x264enc", "rec_encoder").map_err(|_| {
-        anyhow::anyhow!(
-            "x264enc element not available - install gstreamer1.0-plugins-ugly on the target. \
-             openh264enc is intentionally not used as a fallback for recording (subtle \
-             quality / parser-compat issues with mp4 mux)."
-        )
-    })?;
-    encoder.set_property_from_str("speed-preset", "ultrafast");
-    encoder.set_property_from_str("tune", "zerolatency");
-    // threads=0 lets x264 pick worker count; matches the legacy tee
-    // branch.
-    encoder.set_property("threads", 0u32);
-    encoder.set_property("bitrate", bitrate_kbps);
-    encoder.set_property("key-int-max", fps);
+    // Pin the input framerate so the encoder writes the
+    // configured fps into the H.264 SPS. Without this capsfilter
+    // intervideosrc renegotiates downstream and the encoder ends up
+    // tagging the stream as 25/1 (the gst-plugins-bad default
+    // template caps) even when the producer is at 30 fps - players
+    // that trust SPS metadata then mis-time playback (recordings
+    // appear slow / fast depending on what the player honours). The
+    // PTS-derived rate is unchanged; this is metadata-only and does
+    // not drop or duplicate frames.
+    let rec_framerate_caps = gst::Caps::builder("video/x-raw")
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .build();
+    let framerate_capsfilter = gst::ElementFactory::make("capsfilter")
+        .name("rec_framerate_caps")
+        .property("caps", &rec_framerate_caps)
+        .build()?;
+
+    // Per-encoder chain. threads=0 lets x264 pick worker count;
+    // ignored by nvv4l2h264enc. The recording chain accepts the
+    // openh264enc fallback that build_h264_encoder_chain provides. On
+    // production targets x264enc is the actual path; the fallback only
+    // kicks in on a stripped image where x264enc isn't registered.
+    // Recording uses CQP on NVENC (Jetson) to dodge the
+    // content-adaptive CBR collapse; x264enc (Pi) keeps CBR because
+    // it already pads bits to fill the target. `H264EncodeMode`
+    // makes the per-encoder choice explicit.
+    let rec_mode = match video_encoder {
+        VideoEncoder::Nvv4l2H264 => H264EncodeMode::ConstantQuality {
+            qp: encoder_quality_qp,
+        },
+        VideoEncoder::X264 => H264EncodeMode::Cbr,
+    };
+    let encoder_chain =
+        build_h264_encoder_chain(video_encoder, "rec_", bitrate_kbps, fps, 0, rec_mode)?;
+    let encoder = encoder_chain
+        .last()
+        .cloned()
+        .expect("build_h264_encoder_chain must return at least one element");
 
     let filesink = gst::ElementFactory::make("filesink")
         .name("rec_filesink")
@@ -671,22 +1040,21 @@ pub fn build_recording_video_consumer_pipeline(
     filesink.set_property("async", false);
     filesink.set_property("sync", false);
 
-    pipeline.add_many([
-        &intervideosrc,
-        &valve,
-        &queue,
-        &videoconvert,
-        &encoder,
-        &filesink,
-    ])?;
-    gst::Element::link_many([
-        &intervideosrc,
-        &valve,
-        &queue,
-        &videoconvert,
-        &encoder,
-        &filesink,
-    ])?;
+    // Flat Vec so the variable-length encoder chain
+    // (1 element for X264, 2 for Nvv4l2H264) slots in without
+    // per-encoder special cases at the call site.
+    let mut chain: Vec<gst::Element> = vec![
+        intervideosrc.clone(),
+        valve.clone(),
+        queue.clone(),
+        videoconvert.clone(),
+        framerate_capsfilter.clone(),
+    ];
+    chain.extend(encoder_chain.iter().cloned());
+    chain.push(filesink.clone());
+
+    pipeline.add_many(&chain)?;
+    gst::Element::link_many(&chain)?;
 
     // Probes (frame_count on encoder.sink, valve_count, queue_src_count, pts_log).
     let frame_count = Arc::new(AtomicU64::new(0));
@@ -754,7 +1122,7 @@ pub fn build_recording_video_consumer_pipeline(
 ///
 /// Topology:
 /// ```text
-/// interaudiosrc(channel="aicam-audio-main", do-timestamp=false)
+/// interaudiosrc(channel="aicam-audio-{rec,stream}", do-timestamp=false)
 ///   → valve(audio_rec_valve, drop=true)
 ///   → queue(audio_rec_queue)
 ///   → flacenc(audio_rec_encoder)
@@ -763,7 +1131,7 @@ pub fn build_recording_video_consumer_pipeline(
 ///
 /// Element names are kept identical to the legacy audio recording
 /// branch on the `audio_tee` so the bus error classifier and any
-/// observability hooks (smoke harness, journalctl filters) keep
+/// observability hooks (test harness, journalctl filters) keep
 /// working.
 pub fn build_recording_audio_consumer_pipeline() -> anyhow::Result<RecordingAudioConsumer> {
     gst::init()?;
@@ -775,7 +1143,10 @@ pub fn build_recording_audio_consumer_pipeline() -> anyhow::Result<RecordingAudi
     let interaudiosrc = gst::ElementFactory::make("interaudiosrc")
         .name("rec_interaudiosrc")
         .build()?;
-    interaudiosrc.set_property("channel", AUDIO_CHANNEL);
+    // Read from the recording-only audio channel so this
+    // consumer's GstInterSurface adapter isn't drained by the
+    // streaming consumer when both are active.
+    interaudiosrc.set_property("channel", AUDIO_CHANNEL_RECORDING);
     interaudiosrc.set_property("do-timestamp", false);
 
     let valve = gst::ElementFactory::make("valve")
@@ -802,7 +1173,7 @@ pub fn build_recording_audio_consumer_pipeline() -> anyhow::Result<RecordingAudi
     gst::Element::link_many([&interaudiosrc, &valve, &queue, &encoder, &filesink])?;
 
     info!(
-        channel = AUDIO_CHANNEL,
+        channel = AUDIO_CHANNEL_RECORDING,
         "recording audio consumer pipeline built (valve closed, filesink=/dev/null)"
     );
     Ok(RecordingAudioConsumer {
@@ -1142,10 +1513,14 @@ mod tests {
         let overlay = crate::overlay::new_overlay_state();
         let consumer = build_streaming_consumer_pipeline(
             "rtmp://127.0.0.1:1935/test",
+            1920,
+            1080,
             500,
             30,
             false,
             overlay,
+            VideoEncoder::X264,
+            crate::OverlayRenderer::Cairo,
         )
         .expect("streaming consumer should build (video-only)");
 
@@ -1153,9 +1528,6 @@ mod tests {
         for name in [
             "stream_intervideosrc",
             "stream_queue",
-            "stream_videoscale",
-            "stream_videorate",
-            "stream_downscale_caps",
             "stream_pre_convert",
             "stream_cairooverlay",
             "stream_post_convert",
@@ -1175,6 +1547,12 @@ mod tests {
             );
         }
 
+        // No downscale chain - streaming runs at the
+        // camera's native resolution + configured fps.
+        assert!(consumer.pipeline.by_name("stream_videoscale").is_none());
+        assert!(consumer.pipeline.by_name("stream_videorate").is_none());
+        assert!(consumer.pipeline.by_name("stream_downscale_caps").is_none());
+
         // No interaudiosrc on the video-only path - silence comes
         // from the internal audiotestsrc.
         assert!(consumer.pipeline.by_name("stream_interaudiosrc").is_none());
@@ -1185,10 +1563,6 @@ mod tests {
         // Streaming consumer must re-stamp at its own clock - RTMP/YouTube
         // require PTS that start near zero relative to the stream.
         assert!(src.property::<bool>("do-timestamp"));
-
-        // videorate.skip-to-first must be true - freeze protection.
-        let vr = consumer.pipeline.by_name("stream_videorate").unwrap();
-        assert!(vr.property::<bool>("skip-to-first"));
 
         // h264parse.config-interval must be -1 (mediamtx interop).
         let hp = consumer.pipeline.by_name("stream_h264parse").unwrap();
@@ -1208,16 +1582,27 @@ mod tests {
     fn streaming_consumer_with_audio_uses_interaudiosrc() {
         init_gst();
         let overlay = crate::overlay::new_overlay_state();
-        let consumer =
-            build_streaming_consumer_pipeline("rtmp://127.0.0.1:1935/test", 500, 30, true, overlay)
-                .expect("streaming consumer should build (with audio)");
+        let consumer = build_streaming_consumer_pipeline(
+            "rtmp://127.0.0.1:1935/test",
+            1920,
+            1080,
+            500,
+            30,
+            true,
+            overlay,
+            VideoEncoder::X264,
+            crate::OverlayRenderer::Cairo,
+        )
+        .expect("streaming consumer should build (with audio)");
 
         let src = consumer
             .pipeline
             .by_name("stream_interaudiosrc")
             .expect("interaudiosrc must exist when has_audio=true");
         assert_eq!(src.factory().unwrap().name(), "interaudiosrc");
-        assert_eq!(src.property::<String>("channel"), AUDIO_CHANNEL);
+        // Streaming consumer reads from the streaming-only
+        // audio channel; recording reads from AUDIO_CHANNEL_RECORDING.
+        assert_eq!(src.property::<String>("channel"), AUDIO_CHANNEL_STREAMING);
         // Streaming consumer re-stamps at its own clock so RTMP/YouTube
         // see monotonically increasing PTS starting near zero.
         assert!(src.property::<bool>("do-timestamp"));
@@ -1239,10 +1624,14 @@ mod tests {
         let overlay = crate::overlay::new_overlay_state();
         let consumer = build_streaming_consumer_pipeline(
             "rtmp://127.0.0.1:1935/test",
+            1920,
+            1080,
             500,
             30,
             false,
             overlay,
+            VideoEncoder::X264,
+            crate::OverlayRenderer::Cairo,
         )
         .expect("streaming consumer should build");
 
@@ -1263,9 +1652,8 @@ mod tests {
     /// is `fakesink`. The default-build path uses `rtmpsink` and
     /// would require a live RTMP receiver to preroll cleanly, which
     /// the unit-test environment doesn't have - that's covered by
-    /// `make smoke` and Pi validation. End-to-end buffer flow across
-    /// the inter-pipeline transport is exercised on Pi via
-    /// `scripts/run_pi_smoke_tests.sh`.
+    /// device validation. End-to-end buffer flow across the
+    /// inter-pipeline transport is exercised on-device.
     #[cfg(feature = "streaming_benchmark")]
     #[test]
     fn streaming_consumer_reaches_paused_in_fakesink_mode() {
@@ -1273,10 +1661,14 @@ mod tests {
         let overlay = crate::overlay::new_overlay_state();
         let consumer = build_streaming_consumer_pipeline(
             "rtmp://127.0.0.1:1935/unused",
+            1920,
+            1080,
             500,
             30,
             false,
             overlay,
+            VideoEncoder::X264,
+            crate::OverlayRenderer::Cairo,
         )
         .expect("streaming consumer should build");
         let res = consumer.pipeline.set_state(gst::State::Paused);
@@ -1297,16 +1689,17 @@ mod tests {
     #[test]
     fn recording_video_consumer_builds_with_expected_elements() {
         init_gst();
-        let consumer = match build_recording_video_consumer_pipeline(30, 8192) {
-            Ok(c) => c,
-            Err(e) => {
-                // x264enc may be absent on a stripped CI image; that's a
-                // missing-plugin error, not a logic bug. Skip in that
-                // case rather than report a false failure.
-                eprintln!("recording video consumer unavailable: {e}");
-                return;
-            }
-        };
+        let consumer =
+            match build_recording_video_consumer_pipeline(30, 8192, VideoEncoder::X264, 30) {
+                Ok(c) => c,
+                Err(e) => {
+                    // x264enc may be absent on a stripped CI image; that's a
+                    // missing-plugin error, not a logic bug. Skip in that
+                    // case rather than report a false failure.
+                    eprintln!("recording video consumer unavailable: {e}");
+                    return;
+                }
+            };
 
         // Element-name contracts (the bus error classifier matches
         // `rec_*` prefixes against these names).
@@ -1353,13 +1746,14 @@ mod tests {
     #[test]
     fn recording_video_consumer_reaches_paused_with_no_producer() {
         init_gst();
-        let consumer = match build_recording_video_consumer_pipeline(30, 1000) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("recording video consumer unavailable: {e}");
-                return;
-            }
-        };
+        let consumer =
+            match build_recording_video_consumer_pipeline(30, 1000, VideoEncoder::X264, 30) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("recording video consumer unavailable: {e}");
+                    return;
+                }
+            };
         let res = consumer.pipeline.set_state(gst::State::Paused);
         let _ = consumer.pipeline.set_state(gst::State::Null);
         assert!(
@@ -1403,7 +1797,7 @@ mod tests {
                 .by_name("rec_interaudiosrc")
                 .unwrap()
                 .property::<String>("channel"),
-            AUDIO_CHANNEL
+            AUDIO_CHANNEL_RECORDING
         );
         assert!(consumer.valve.property::<bool>("drop"));
         assert_eq!(
@@ -1445,8 +1839,7 @@ mod tests {
     // therefore probe the few things that *are* deterministic
     // without Hailo: the appsink-name contract, and that the env-var
     // setup happens before the (Hailo-element-failing) build call
-    // returns. End-to-end is exercised on Pi via
-    // `scripts/run_pi_smoke_tests.sh dev-pi-04` and live
+    // returns. End-to-end is exercised on-device via live
     // `/api/v1/object_detection_preview/frame` polling.
 
     #[test]
@@ -1473,6 +1866,190 @@ mod tests {
             inference_fps: Some(3.0),
             notes: None,
             publish_detections: true,
+        }
+    }
+
+    // ----- pluggable H.264 encoder ----------------------------
+
+    /// `VideoEncoder::parse` accepts the two production values + falls
+    /// back to `X264` on anything else so a typo in the deployment
+    /// script doesn't take the box down.
+    #[test]
+    fn video_encoder_parse_table() {
+        assert_eq!(VideoEncoder::parse("x264"), VideoEncoder::X264);
+        assert_eq!(VideoEncoder::parse("nvv4l2_h264"), VideoEncoder::Nvv4l2H264);
+        assert_eq!(VideoEncoder::parse("typo"), VideoEncoder::X264);
+        assert_eq!(VideoEncoder::parse(""), VideoEncoder::X264);
+    }
+
+    /// Each `VideoEncoder` variant must produce a buildable recording
+    /// consumer pipeline on the dev container (no nvenc registered).
+    /// The Nvv4l2H264 variant degrades to the x264 chain in this
+    /// environment - same fallback the production code does on a
+    /// non-Jetson host.
+    #[test]
+    fn recording_consumer_builds_for_every_video_encoder() {
+        init_gst();
+        for enc in [VideoEncoder::X264, VideoEncoder::Nvv4l2H264] {
+            let consumer = build_recording_video_consumer_pipeline(30, 4000, enc, 30)
+                .unwrap_or_else(|e| panic!("recording build failed for {enc:?}: {e}"));
+            // Encoder element name is contract: chain-wide probes and
+            // bus-error classifiers look it up by "rec_encoder".
+            assert!(
+                consumer.pipeline.by_name("rec_encoder").is_some(),
+                "{enc:?}: rec_encoder element must exist",
+            );
+            let _ = consumer.pipeline.set_state(gst::State::Null);
+        }
+    }
+
+    /// Same for the streaming consumer: every encoder variant builds
+    /// without error on the dev container.
+    #[test]
+    fn streaming_consumer_builds_for_every_video_encoder() {
+        init_gst();
+        let overlay_state = crate::overlay::new_overlay_state();
+        for enc in [VideoEncoder::X264, VideoEncoder::Nvv4l2H264] {
+            let consumer = build_streaming_consumer_pipeline(
+                "rtmp://test/live",
+                1920,
+                1080,
+                2500,
+                30,
+                false,
+                overlay_state.clone(),
+                enc,
+                crate::OverlayRenderer::Cairo,
+            )
+            .unwrap_or_else(|e| panic!("streaming build failed for {enc:?}: {e}"));
+            assert!(
+                consumer.pipeline.by_name("stream_encoder").is_some(),
+                "{enc:?}: stream_encoder element must exist",
+            );
+            let _ = consumer.pipeline.set_state(gst::State::Null);
+        }
+    }
+
+    /// When the operator picks `nv12_native` but the
+    /// `aicamnv12overlay` factory isn't registered (no `.so` on
+    /// `GST_PLUGIN_PATH` - dev container / pre-install host), the
+    /// builder must fall back to the cairo bracket so the stream
+    /// still comes up. Without that fallback a fresh
+    /// `/streaming/start` would 500 on every operator-misconfigured
+    /// host.
+    #[test]
+    fn streaming_consumer_nv12_native_falls_back_to_cairo_when_plugin_absent() {
+        init_gst();
+        assert!(
+            gst::ElementFactory::find("aicamnv12overlay").is_none(),
+            "test assumes the NV12 plugin .so is not on GST_PLUGIN_PATH \
+             in the dev container; install changes this and this test \
+             needs to be re-examined"
+        );
+
+        let overlay = crate::overlay::new_overlay_state();
+        let consumer = build_streaming_consumer_pipeline(
+            "rtmp://127.0.0.1:1935/test",
+            1920,
+            1080,
+            500,
+            30,
+            false,
+            overlay,
+            VideoEncoder::X264,
+            crate::OverlayRenderer::Nv12Native,
+        )
+        .expect("streaming consumer should build (NV12 → cairo fallback)");
+
+        // Cairo bracket must have been built - the operator-requested
+        // nv12_native silently downgraded.
+        assert!(consumer.pipeline.by_name("stream_cairooverlay").is_some());
+        assert!(consumer.pipeline.by_name("stream_nv12overlay").is_none());
+        assert!(consumer.nv12_overlay_element.is_none());
+
+        let _ = consumer.pipeline.set_state(gst::State::Null);
+    }
+
+    /// Streaming consumer pins the input framerate so the
+    /// H.264 SPS metadata matches the actual capture rate. Without
+    /// the capsfilter intervideosrc renegotiates downstream caps to
+    /// the gst-plugins-bad default (25/1) and players that trust
+    /// SPS timing mis-time playback. Element exists and its caps
+    /// carry `framerate=fps/1`.
+    #[test]
+    fn streaming_consumer_pins_framerate_caps() {
+        init_gst();
+        let overlay = crate::overlay::new_overlay_state();
+        let consumer = build_streaming_consumer_pipeline(
+            "rtmp://127.0.0.1:1935/test",
+            1920,
+            1080,
+            500,
+            30,
+            false,
+            overlay,
+            VideoEncoder::X264,
+            crate::OverlayRenderer::Cairo,
+        )
+        .expect("streaming consumer should build");
+        let cf = consumer
+            .pipeline
+            .by_name("stream_framerate_caps")
+            .expect("stream_framerate_caps must exist");
+        let caps: gst::Caps = cf.property("caps");
+        let s = caps.structure(0).expect("caps must have a structure");
+        let fr: gst::Fraction = s
+            .get("framerate")
+            .expect("framerate field must be set on stream_framerate_caps");
+        assert_eq!(fr.numer(), 30);
+        assert_eq!(fr.denom(), 1);
+        let _ = consumer.pipeline.set_state(gst::State::Null);
+    }
+
+    /// Recording consumer pins the input framerate for
+    /// the same reason as the streaming consumer above.
+    #[test]
+    fn recording_consumer_pins_framerate_caps() {
+        init_gst();
+        let consumer = build_recording_video_consumer_pipeline(30, 8192, VideoEncoder::X264, 30)
+            .expect("recording consumer should build");
+        let cf = consumer
+            .pipeline
+            .by_name("rec_framerate_caps")
+            .expect("rec_framerate_caps must exist");
+        let caps: gst::Caps = cf.property("caps");
+        let s = caps.structure(0).expect("caps must have a structure");
+        let fr: gst::Fraction = s
+            .get("framerate")
+            .expect("framerate field must be set on rec_framerate_caps");
+        assert_eq!(fr.numer(), 30);
+        assert_eq!(fr.denom(), 1);
+        let _ = consumer.pipeline.set_state(gst::State::Null);
+    }
+
+    /// When the encoder is `Nvv4l2H264`, the recording
+    /// consumer must request `H264EncodeMode::ConstantQuality` with
+    /// the operator-configured QP. The streaming consumer must
+    /// stay on `Cbr`. The H264EncodeMode itself doesn't surface on
+    /// the live pipeline (it just sets element properties), so the
+    /// strongest test we can run without a real Tegra is the
+    /// per-encoder mode dispatch in `build_recording_video_consumer_pipeline`,
+    /// which falls back to the X264 chain when nvv4l2h264enc is
+    /// absent (dev container). Verify the chain at least builds for
+    /// every encoder × QP combination without panicking.
+    #[test]
+    fn recording_consumer_builds_for_every_encoder_and_qp() {
+        init_gst();
+        for enc in [VideoEncoder::X264, VideoEncoder::Nvv4l2H264] {
+            for qp in [18u32, 22, 30, 35, 42] {
+                let consumer = build_recording_video_consumer_pipeline(30, 8192, enc, qp)
+                    .unwrap_or_else(|e| panic!("build failed for {enc:?} qp={qp}: {e}"));
+                assert!(
+                    consumer.pipeline.by_name("rec_encoder").is_some(),
+                    "rec_encoder missing for {enc:?} qp={qp}"
+                );
+                let _ = consumer.pipeline.set_state(gst::State::Null);
+            }
         }
     }
 

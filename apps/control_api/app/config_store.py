@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import AppConfig
+from .models import AppConfig, normalize_for_platform
 
 
 class ConfigStore:
@@ -21,10 +21,12 @@ class ConfigStore:
         self.path = Path(path)
 
     def load(self) -> AppConfig:
+        # normalize_for_platform forces AI features off when
+        # deployment.platform == "jetson". On Pi this is a no-op.
         if not self.path.exists():
-            return AppConfig()
+            return normalize_for_platform(AppConfig())
         data = yaml.safe_load(self.path.read_text()) or {}
-        return AppConfig.model_validate(data)
+        return normalize_for_platform(AppConfig.model_validate(data))
 
     def save(self, config: AppConfig) -> None:
         self.path.write_text(yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False))

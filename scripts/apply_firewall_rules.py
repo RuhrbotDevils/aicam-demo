@@ -50,7 +50,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from apps.control_api.app.firewall import render_from_config  # noqa: E402
+from apps.control_api.app.firewall import (  # noqa: E402
+    parse_scope_link_subnets,
+    render_from_config,
+)
 
 DEFAULT_CONFIG = _REPO_ROOT / "config.yaml"
 DEFAULT_RULE_DIR = Path("/etc/iptables")
@@ -80,6 +83,36 @@ def _read_allowed_ip_ranges(config_path: Path) -> str:
         )
         return "*"
     return ((data.get("network") or {}).get("firewall") or {}).get("allowed_ip_ranges") or "*"
+
+
+def _discover_local_subnets() -> tuple[list[str], list[str]]:
+    """The camera's directly-connected (on-link) subnets.
+
+    Reads `ip -o route show scope link` for each family. Those routes
+    are the interface subnets only, so networks reachable via the
+    gateway are excluded by construction. Best-effort: if `ip` is
+    missing or errors, returns empty lists and the GameController port
+    simply stays closed (fail-safe, never fail-open).
+    """
+
+    def _family(flag: str) -> list[str]:
+        ip_bin = shutil.which("ip")
+        if not ip_bin:
+            logger.warning("`ip` not found - GameController port not opened to local nets")
+            return []
+        try:
+            result = subprocess.run(
+                [ip_bin, flag, "-o", "route", "show", "scope", "link"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as e:
+            logger.warning("`ip %s route` failed (%s) - GameController port left closed", flag, e)
+            return []
+        return parse_scope_link_subnets(result.stdout)
+
+    return _family("-4"), _family("-6")
 
 
 def _apply_restore(rule_path: Path, restore_binary: str) -> int:
@@ -148,7 +181,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     raw = _read_allowed_ip_ranges(args.config)
-    v4_rules, v6_rules = render_from_config(raw)
+    local_v4, local_v6 = _discover_local_subnets()
+    if local_v4 or local_v6:
+        logger.info(
+            "GameController (3838) allowed from local nets: v4=%s v6=%s", local_v4, local_v6
+        )
+    v4_rules, v6_rules = render_from_config(raw, local_v4, local_v6)
 
     if args.dry_run:
         sys.stdout.write("# ===== IPv4 (iptables-restore) =====\n")

@@ -263,22 +263,26 @@ label {
 .magnifier-target {
   cursor: zoom-in;
 }
-
+.magnifier-target.magnifier-active,
+.magnifier-target:active {
+  cursor: zoom-in;
+}
 .magnifier-popup {
   position: fixed;
-  pointer-events: none;
-  z-index: 9999;
-  border: 2px solid var(--accent, #4fa3ff);
-  border-radius: 4px;
+  display: none;
+  border: 2px solid var(--accent, #4ad);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  background: #000;
   overflow: hidden;
-  background: black;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  z-index: 2000;
 }
-
-.magnifier-popup img {
+.magnifier-popup-img {
   position: absolute;
   max-width: none;
   user-select: none;
+  -webkit-user-drag: none;
 }
 
 /* --- Recording --- */

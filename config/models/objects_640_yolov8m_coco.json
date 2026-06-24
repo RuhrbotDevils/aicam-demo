@@ -1,5 +1,5 @@
 {
-    "display_name": "COCO YOLOv8m (Hailo-10H)",
+    "display_name": "YOLOv8m COCO (Hailo-10H)",
     "id": "yolov8m_coco_640",
     "scope": "object_detection",
     "active": true,
@@ -17,8 +17,8 @@
         "32": "ball",
         "64": "ball",
         "65": "ball",
-        "1": "human"
+        "0": "human"
     },
-    "notes": "Demo model from Hailo Model Zoo. 80 COCO classes, NMS. For Demonstration purposes, this model remaps COCO sports ball, laptop and mouse to ball and COCO class 1 (person) to human.",
+    "notes": "Demo model from Hailo Model Zoo. 80 COCO classes, NMS baked in. class_map remaps COCO class 32 (sports ball) to ball and class 0 (person) to human.",
     "inference_fps": 3
 }

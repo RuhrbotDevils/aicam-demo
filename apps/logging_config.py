@@ -29,6 +29,29 @@ import structlog
 _STDLIB_HANDLER_FLAG = "_aicam_apps_stdlib_handler"
 
 
+class _LiveStdout:
+    """File-like wrapper that resolves ``sys.stdout`` on every write.
+
+    Background daemon threads (e.g. ``ReplayFrameSource.run``) that
+    emit log lines can outlive a pytest stdout-capture window. The
+    structlog ``PrintLogger`` binds its file at construction, and
+    ``cache_logger_on_first_use=True`` keeps that binding for the
+    process lifetime - so a logger created during test A keeps
+    writing to test A's captured stream long after pytest has closed
+    it, surfacing as ``ValueError: I/O operation on closed file``.
+    Forwarding through the live ``sys.stdout`` avoids that.
+    """
+
+    def write(self, s: str) -> int:
+        return sys.stdout.write(s)
+
+    def flush(self) -> None:
+        sys.stdout.flush()
+
+
+_LIVE_STDOUT = _LiveStdout()
+
+
 def configure_logging(level: str = "INFO") -> None:
     """Configure structlog for JSON output to stdout.
 
@@ -47,7 +70,7 @@ def configure_logging(level: str = "INFO") -> None:
             getattr(logging, level.upper(), logging.INFO)
         ),
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        logger_factory=structlog.PrintLoggerFactory(file=_LIVE_STDOUT),  # type: ignore[arg-type]
         cache_logger_on_first_use=True,
     )
 
@@ -67,7 +90,11 @@ def configure_stdlib_logging(
     """Attach a stdout ``StreamHandler`` to the ``apps`` logger tree.
 
     This is the escape hatch for code that still uses
-    ``logging.getLogger(__name__)`` rather than structlog.
+    ``logging.getLogger(__name__)`` rather than structlog - notably the
+    FastAPI control API, which runs under uvicorn. Without this call,
+    uvicorn configures its own ``uvicorn.*`` loggers but leaves the
+    ``apps.*`` tree with no handler, so every ``logger.info(...)`` call
+    is silently dropped.
 
     The handler is attached to ``apps`` (not root) so that uvicorn's
     own access/error logs are not double-routed. ``propagate`` is
@@ -102,6 +129,11 @@ def configure_stdlib_logging(
 
     target.addHandler(handler)
     target.setLevel(numeric_level)
+    # Leave ``propagate`` at its default (True). Nothing inside the
+    # control_api process attaches a handler to the root logger
+    # (uvicorn only configures its own ``uvicorn.*`` loggers), so
+    # propagation does not cause duplicates in practice - and keeping
+    # it lets pytest's ``caplog`` fixture capture our records.
 
     setattr(target, _STDLIB_HANDLER_FLAG, True)
     return target

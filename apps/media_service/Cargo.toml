@@ -23,6 +23,20 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
+# NV12-native overlay element (aicamnv12overlay) is loaded
+# by GStreamer at runtime from GST_PLUGIN_PATH (via the cdylib built
+# from this same crate, installed to /opt/aicam-extra-plugins/). We
+# pull the crate WITHOUT the `plugin` feature: media_service only
+# needs the `layout::ScoreboardState` / `Rgba` / `PenaltyTile` data
+# types (for the cairo-side → JSON conversion) - it must NOT link
+# the `Nv12Overlay` GObject subclass, because glib would then see
+# the same `AicamNv12Overlay` C name registered twice (once via the
+# dlopen-loaded .so, once via the in-binary statically-linked copy)
+# and panic. Producer → element communication happens through the
+# `scoreboard-state-json` GObject property by name, which works on
+# a generic `gst::Element` handle.
+aicam_broadcast_overlay = { path = "../broadcast_overlay", default-features = false }
+
 [features]
 default = []
 # When enabled, the streaming branch uses a fakesink instead of

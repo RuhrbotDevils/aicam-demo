@@ -4,15 +4,21 @@
 /**
  * Playback page - select a previously recorded match from the
  * playback/ directory, choose which half to replay, and
- * start/stop the replay from a single button. 
-*/
+ * start/stop the replay from a single button.
+ *
+ * Phase 1: uses the Python VideoReplaySource +
+ * GC ReplaySource running as background threads inside the
+ * control API. The AI path is the FakeDetector (CPU).
+ * Phase 2 upgrades this with GStreamer filesrc +
+ * full Hailo cascade.
+ */
 const PlaybackPage = {
   _pollInterval: null,
   _autoRefresh: false,
   _refreshTimer: null,
   _sessions: [],
   _isActive: false,  // true while a playback or replay is producing frames
-  _wasActive: false, // previous _isActive: drives the auto-revert auto-refresh
+  _wasActive: false, // previous _isActive - drives the auto-revert auto-refresh
   _autoRefreshBeforePlayback: null,  // null = no remembered prior state
   _currentSpeed: 1,  // last speed sent on /replay/start or /playback/start
 
@@ -185,6 +191,9 @@ const PlaybackPage = {
       this._currentSpeed = speed;
       if (isRec) {
         // Converted recording -> media-service replay (GStreamer MP4).
+        // Speed=0 in the dropdown is the "Max" option - the media
+        // service interprets that as "drain at decode speed" by
+        // bypassing the replay bin's clocksync.
         await API.post('/replay/start', { session_id: session, speed });
       } else {
         const half = parseInt(document.getElementById('pb-half')?.value || '1');
@@ -196,6 +205,13 @@ const PlaybackPage = {
       Notify.error('Failed to start playback: ' + e.message);
     }
     if (started) {
+      // Remember the auto-refresh state so it can be restored when
+      // playback ends (manual stop or natural EOS), then turn
+      // auto-refresh on so the operator sees frames flowing without an
+      // extra click. Set `_isActive` optimistically here - the next
+      // _refreshStatus tick will either confirm or correct it. Without
+      // this, _applyPreviewControls would race in and disable +
+      // uncheck the checkbox before the first status poll.
       this._autoRefreshBeforePlayback = this._autoRefresh;
       this._isActive = true;
       this._wasActive = true;
@@ -226,6 +242,10 @@ const PlaybackPage = {
 
   async _refreshStatus() {
     try {
+      // Pull both replay paths so the status panel works for either a
+      // Phase-1 Python playback (videoreplay session) or a media-service
+      // replay (converted MP4 recording). Whichever is producing frames
+      // wins.
       const [pb, rep] = await Promise.all([
         API.get('/playback/status').catch(() => ({})),
         API.get('/replay/status').catch(() => ({})),
@@ -279,7 +299,7 @@ const PlaybackPage = {
         this._isActive = false;
       }
 
-      // Active → not active transition: restore the auto-refresh
+      // Active -> not active transition: restore the auto-refresh
       // state we captured on start(). Catches both manual Stop and
       // natural EOS (replay returns to idle when the file ends).
       if (this._wasActive && !this._isActive) {

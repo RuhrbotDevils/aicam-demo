@@ -90,6 +90,76 @@ def _default_cpu_detection_flag_loader() -> bool:
     return bool(ConfigStore(Path("config.yaml")).load().features.cpu_detection)
 
 
+def _atomic_write_jpeg(path: Path, frame: np.ndarray, quality: int = 95) -> bool:
+    """Encode *frame* to JPEG and replace *path* atomically.
+
+    Writes to a per-pid sibling tempfile (via :func:`tempfile.mkstemp`
+    which carries OS-level PID + random suffix) then ``os.replace``s it
+    onto *path*. Readers either see the previous file or the new file -
+    never a half-written stream. Returns False on encode failure so
+    callers can log and skip.
+    """
+    import os
+    import tempfile
+
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return False
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(buf.tobytes())
+        os.replace(tmp_name, path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write *content* to *path* atomically (UTF-8).
+
+    Paired with :func:`_atomic_write_jpeg` for the sidecar so consumers
+    gating on the sidecar's mtime can't read a partial file. Raises
+    ``OSError`` on failure so the caller can log and skip.
+    """
+    import os
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_name, path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _normalize_model_names(names: object) -> dict[int, str]:
+    """Normalise an Ultralytics ``model.names`` value to ``dict[int, str]``.
+
+    Ultralytics has shipped both a
+    ``dict[int, str]`` (typical on fine-tuned checkpoints loaded
+    from ``.pt``) and a ``list[str]`` / ``tuple[str, ...]`` (some
+    older COCO defaults) in ``model.names``. Returning a uniform
+    mapping lets the resolver use ``.get(cls_id)`` regardless of
+    source shape. Unrecognised inputs return an empty dict so the
+    synthetic ``class_<id>`` fallback still kicks in.
+    """
+    if isinstance(names, dict):
+        return {int(k): str(v) for k, v in names.items()}
+    if isinstance(names, list | tuple):
+        return {i: str(v) for i, v in enumerate(names)}
+    return {}
+
+
 class CpuDetector:
     """Object detector running YOLO on CPU via Ultralytics."""
 
@@ -135,16 +205,9 @@ class CpuDetector:
             from ultralytics import YOLO
 
             self._model = YOLO(self._model_path, task="detect")
-            # `model.names` is dict[int,str] for detection checkpoints.
-            # Captured here so the publish path can resolve real class
-            # names without hitting the model object on every frame.
-            raw_names = getattr(self._model, "names", None)
-            if isinstance(raw_names, dict):
-                self._model_names = {int(k): str(v) for k, v in raw_names.items()}
-            elif isinstance(raw_names, list):
-                self._model_names = {i: str(v) for i, v in enumerate(raw_names)}
-            else:
-                self._model_names = {}
+            # Capture the checkpoint's class-name map via the
+            # shape-agnostic helper.
+            self._model_names = _normalize_model_names(getattr(self._model, "names", None))
             logger.info(
                 "cpu_detector: loaded %s (model.names=%s)",
                 self._model_path,
@@ -308,13 +371,28 @@ class CpuDetector:
         if detections:
             draw_detection_boxes(annotated, detections)
 
-        ok_a, buf_a = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if not ok_a:
-            logger.warning("cpu_detector: cv2.imencode failed for annotated jpeg")
+        out_dir = INFERENCE_ARTIFACTS_DIR
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("cpu_detector: failed to mkdir %s: %s", out_dir, e)
             return
-        ok_r, buf_r = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if not ok_r:
-            logger.warning("cpu_detector: cv2.imencode failed for raw jpeg")
+
+        ann_path = out_dir / "cpu_annotated.jpg"
+        raw_path = out_dir / "cpu_raw.jpg"
+        sidecar_path = out_dir / "cpu_detections.json"
+
+        # Each file goes through a per-pid sibling tempfile and a
+        # final os.replace so the
+        # preview endpoint never sees a half-written JPEG (cv2.imwrite
+        # is not atomic on all filesystems). Sidecar is written last
+        # so any consumer that gates on its mtime is guaranteed to see
+        # matching JPEGs from the same inference pass.
+        if not _atomic_write_jpeg(raw_path, frame, quality=85):
+            logger.warning("cpu_detector: failed to write raw JPEG %s", raw_path)
+            return
+        if not _atomic_write_jpeg(ann_path, annotated, quality=85):
+            logger.warning("cpu_detector: failed to write annotated JPEG %s", ann_path)
             return
 
         h_px, w_px = frame.shape[:2]
@@ -332,22 +410,11 @@ class CpuDetector:
                 for d in detections
             ],
         }
-
         try:
-            out_dir = INFERENCE_ARTIFACTS_DIR
-            out_dir.mkdir(parents=True, exist_ok=True)
-            ann_tmp = out_dir / "cpu_annotated.tmp"
-            raw_tmp = out_dir / "cpu_raw.tmp"
-            json_tmp = out_dir / "cpu_detections.tmp"
-            ann_tmp.write_bytes(buf_a.tobytes())
-            raw_tmp.write_bytes(buf_r.tobytes())
-            json_tmp.write_text(json.dumps(sidecar))
-            # Rename sidecar last: consumers gate on its mtime.
-            ann_tmp.replace(out_dir / "cpu_annotated.jpg")
-            raw_tmp.replace(out_dir / "cpu_raw.jpg")
-            json_tmp.replace(out_dir / "cpu_detections.json")
-        except Exception as e:
-            logger.warning("cpu_detector: failed to write inference artifacts: %s", e)
+            _atomic_write_text(sidecar_path, json.dumps(sidecar))
+        except OSError as e:
+            logger.warning("cpu_detector: failed to write sidecar %s: %s", sidecar_path, e)
+            return
 
     def run(self, timeout_ms: int = 1000) -> int:
         """Run the detector loop.
@@ -442,7 +509,7 @@ class CpuDetector:
 # `run_oneshot_snap()` synchronously, which loads the YOLO model on
 # first call (~3-5 s), then runs one inference per call. The model is
 # cached in this module so subsequent snaps cost only inference time
-# (~3-5 s on a Pi 5 CPU).
+# (~1-3 s on a Pi 5 CPU at 640×640).
 
 
 class _OneShotRuntime:

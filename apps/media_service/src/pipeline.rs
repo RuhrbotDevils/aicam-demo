@@ -33,7 +33,7 @@ use tracing::{info, warn};
 /// `None` means "no model selected; skip the AI consumer". The demo
 /// build supports a single scope - `object_detection`. Cascade
 /// classifiers (robot type, jersey colour) and the
-/// `landmark_detection` scope are not available in the demo.
+/// `landmark_detection` scope were removed in the demo simplification.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct AiConfig {

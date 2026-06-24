@@ -15,7 +15,7 @@ const DashboardPage = {
   _metricsInterval: null,
   _liveInterval: null,
   _cameraPreviewStarted: false,
-  _restartCooldowns: {},  // service_name → timestamp when cooldown expires
+  _restartCooldowns: {},  // service_name -> timestamp when cooldown expires
   _replayState: { active: false, position_s: 0, duration_s: 0 },
   _lastReplayActive: false,
   _lastReplayPos: -1,
@@ -53,7 +53,13 @@ const DashboardPage = {
     this._lastReplayActive = false;
     this._lastReplayPos = -1;
     this._replayState = { active: false, position_s: 0, duration_s: 0 };
-    Magnifier.attach(document.getElementById('camera-preview-box'));
+    // Guard against the magnifier widget not being loaded (e.g. the
+    // script tag was stripped) and against the tile element being
+    // absent.
+    if (typeof Magnifier !== 'undefined') {
+      const tile = document.getElementById('camera-preview-box');
+      if (tile) Magnifier.attach(tile);
+    }
     this._refreshNodeId();
     this._refreshMetrics();
     this._refreshReplay();
@@ -252,17 +258,22 @@ const DashboardPage = {
     // Preserve <details> open state across refreshes
     const coresOpen = document.querySelector('.cpu-cores-details')?.open || false;
 
-    // Temperatures - display as one decimal place (e.g. 41.5 C).
+    // Temperatures - display as one decimal place (e.g. 41.5 C). The
+    // backend may return more precision (pyhailort emits floats with
+    // ~6 fractional digits) but the dashboard only needs one.
     const fmtTemp = (v) => v != null ? `${v.toFixed(1)} C` : 'n/a';
     const socTemp = fmtTemp(m.temperature.soc);
     const socClass = m.temperature.soc > 75 ? 'metric-warn' : m.temperature.soc > 65 ? 'metric-caution' : '';
-    // Hailo: prefer per-thermistor (TS0/TS1) when available.
-    // Hailo-10H has two on-chip thermistors and we surface
-    // both.
+    // Hailo: prefer per-thermistor (TS0/TS1) when available, fall
+    // back to the combined max value the API always exposes as
+    // `hailo`. Hailo-10H has two on-chip thermistors and we surface
+    // both so an operator can see asymmetric heating.
     const hailoTs0 = m.temperature.hailo_ts0;
     const hailoTs1 = m.temperature.hailo_ts1;
     const hailoMax = m.temperature.hailo;
     const hailoTempStr = fmtTemp(hailoMax);
+    // Per-thermistor detail rendered on its own line beneath the
+    // headline value, right-aligned with the metric-value column.
     const hailoTempDetail = (hailoTs0 != null && hailoTs1 != null)
       ? `<div class="stats-muted" style="font-size:0.75em;text-align:right;margin-top:-0.15rem">(TS0 ${hailoTs0.toFixed(1)} / TS1 ${hailoTs1.toFixed(1)})</div>`
       : '';
