@@ -196,6 +196,12 @@ def _render_v4(policy: FirewallPolicy, local_v4: list[str]) -> str:
 :INPUT DROP [0:0]
 :FORWARD DROP [0:0]
 :OUTPUT ACCEPT [0:0]
+# Flush only our INPUT chain. Applied with `iptables-restore --noflush`,
+# so this is the one chain we own: it clears prior AICam rules atomically
+# (no duplicate accumulation across re-applies) while leaving FORWARD /
+# OUTPUT and any other filter chains (Docker, ufw) and the nat table
+# untouched.
+-F INPUT
 
 # Loopback (127.0.0.1) is always allowed - control_api ↔
 # media_service (8090) and ZMQ broker (5559/5560) ride lo.
@@ -205,9 +211,8 @@ def _render_v4(policy: FirewallPolicy, local_v4: list[str]) -> str:
 # apt update, etc.).
 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-# ICMP echo for diagnostics (ping, path-MTU discovery).
--A INPUT -p icmp --icmp-type echo-request -j ACCEPT
--A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
+# ICMP from everywhere (ping + diagnostics).
+-A INPUT -p icmp -j ACCEPT
 
 # DHCP client (bootpc/68). Replies ride the established rule above.
 -A INPUT -p udp --dport 68 -j ACCEPT
@@ -250,20 +255,16 @@ def _render_v6(policy: FirewallPolicy, local_v6: list[str]) -> str:
 :INPUT DROP [0:0]
 :FORWARD DROP [0:0]
 :OUTPUT ACCEPT [0:0]
+# Flush only our INPUT chain; see the IPv4 renderer.
+-F INPUT
 
 -A INPUT -i lo -j ACCEPT
 
 -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-# ICMPv6 - echo for diagnostics, neighbor discovery (essential -
-# without ND the v6 stack can't resolve link-local neighbors),
-# router advertisements (so the box keeps its v6 default route).
--A INPUT -p icmpv6 --icmpv6-type echo-request -j ACCEPT
--A INPUT -p icmpv6 --icmpv6-type echo-reply -j ACCEPT
--A INPUT -p icmpv6 --icmpv6-type neighbour-solicitation -j ACCEPT
--A INPUT -p icmpv6 --icmpv6-type neighbour-advertisement -j ACCEPT
--A INPUT -p icmpv6 --icmpv6-type router-advertisement -j ACCEPT
--A INPUT -p icmpv6 --icmpv6-type router-solicitation -j ACCEPT
+# ICMPv6 from everywhere (ping + neighbor discovery + router
+# advertisements; ND is essential for the v6 stack).
+-A INPUT -p icmpv6 -j ACCEPT
 
 # DHCPv6 client port.
 -A INPUT -p udp --dport 546 -j ACCEPT
