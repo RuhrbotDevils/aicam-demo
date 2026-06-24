@@ -1,10 +1,10 @@
-# AICam node configuration — example template.
+# AICam node configuration - example template.
 #
-# scripts/install_locally.sh and scripts/setup_pi_env.sh copy this
-# file to config.yaml when one doesn't already exist, then set
-# `node.id` to the install hostname / target id. After install you
-# can edit config.yaml directly, or use the Configuration page in the
-# web UI to tune the runtime values (streaming URL, models, etc.).
+# scripts/install_locally.sh copies this file to config.yaml when one
+# doesn't already exist, then sets `node.id` to the install hostname /
+# target id. After install you can edit config.yaml directly, or use
+# the Configuration page in the web UI to tune the runtime values
+# (streaming URL, models, etc.).
 #
 # All keys here are read by apps/control_api/app/models.py
 # (Pydantic schema). Defaults shown match the in-code defaults so a
@@ -29,11 +29,37 @@ network:
     interface: wlan0
     listen_only: true
     profiles: []
+  # Inbound firewall (nftables). Comma-separated CIDR allowlist for
+  # SSH (TCP 22) + web UI (TCP 8000). All other inbound ports are
+  # dropped regardless of source (media_service 8090, ZMQ broker
+  # 5559/5560 - these listen on localhost-only anyway, but the
+  # firewall enforces it from the outside).
+  #
+  # Default `"*"` allows from anywhere - safe for trusted/NATted
+  # networks. Lock down with a CIDR list when the camera may land on
+  # a public-IP DHCP network at a tournament venue, e.g.:
+  #   allowed_ip_ranges: "192.0.2.0/24, 203.0.113.5/32, 10.10.0.0/16"
+  #
+  # Whitespace around entries is tolerated; invalid CIDRs are
+  # dropped with a warning; an all-invalid config falls back to
+  # `"*"` so a typo can't lock you out of the box. IPv6 CIDRs
+  # work too (just list them alongside).
+  #
+  # Loopback, ICMP echo, established/related, and DHCP client
+  # (UDP 68) are always allowed. Outbound is unrestricted.
+  #
+  # Editing this field via `PUT /api/v1/config` (or the
+  # Configuration UI) re-applies the nftables ruleset
+  # automatically; no service restart needed.
+  firewall:
+    allowed_ip_ranges: "*"
 
 features:
   detection: true
   online_streaming: true
   recording: true
+  # CPU detection runs on demand from the Detection page Snap button.
+  # Leaving the flag enabled lets the UI show the CPU model picker.
   cpu_detection: true
 
 video:
@@ -42,19 +68,98 @@ video:
     width: 1920
     height: 1080
     fps: 30
+    # Horizontally mirror the camera image in the producer before
+    # intervideosink, so every consumer (recording, streaming,
+    # frame_export) sees the corrected image. Operator-set when the
+    # physical camera mount inverts left/right. Default false adds
+    # zero pipeline cost - no extra element is inserted. When true:
+    #   - Libcamera (Pi) / V4l2: inserts `videoflip` (CPU, ~5% at
+    #     1080p30 on Pi 5).
+    #   - Nvargus (Jetson real): sets `flip-method=horizontal-flip`
+    #     on the existing nvvidconv (Tegra VIC, ~zero CPU).
+    # Change takes effect on the next media service restart.
+    flip_horizontal: false
+    # Rotate the producer frames 180 degrees (top/bottom +
+    # left/right). Operator-set when the camera is physically
+    # mounted upside down. Composes with `flip_horizontal`:
+    # the four (rotate_180, flip_horizontal) combinations each
+    # map to a single videoflip / nvvidconv enum value (no extra
+    # element):
+    #   - (false, false) -> no transform.
+    #   - (false, true)  -> horizontal-flip (mirror L/R only).
+    #   - (true,  false) -> rotate-180 (both axes flipped).
+    #   - (true,  true)  -> vertical-flip (top/bottom only,
+    #     equivalent to rotate-180 + horizontal-flip).
+    # Same single-element / single-VIC-pass cost regardless of
+    # combination. Change takes effect on the next media service
+    # restart.
+    rotate_180: false
   recording:
     directory: recordings/
     video_codec: h264
     audio_codec: flac
     audio_enabled: true
+    # GC-driven auto-recording.
+    #   - `manual`   - only POST /recording/start triggers a recording.
+    #   - `automatic` - the control_api's recording_controller
+    #                  subscribes to telemetry.game_state and segments
+    #                  recordings by (team1, team2, match_phase) tuple.
+    #                  PLAYING / READY / SET transitions within the
+    #                  same half do NOT split the recording.
+    # Flipping this from the UI takes effect on the next GC packet -
+    # no service restart required.
     recording_mode: manual
+    # H.264 quantization parameter for the Jetson recording encoder
+    # (`nvv4l2h264enc`) in CQP mode. Used only when
+    # `deployment.video_encoder` is `nvv4l2_h264`; the Pi
+    # (`x264enc`) ignores this and continues to use CBR.
+    #
+    # Why CQP on Jetson: JetPack 4.6's NVENC CBR mode is
+    # content-adaptive - it emits "just enough" bits to maintain
+    # its internal quality target, which on low-motion content
+    # collapses to ~200-300 kbps and produces the blocky
+    # "upscaled" look. CQP guarantees a per-frame quality floor
+    # regardless of motion; the encoder emits whatever bitrate is
+    # needed.
+    #
+    # QP scale (0 = lossless, 51 = worst). Each +5 ≈ halves
+    # bitrate on detail-heavy content:
+    #   22-24: near-lossless; ~100+ Mbps (archival)
+    #   26-28: high quality; ~30-60 Mbps
+    #   30: default - visually clean; ~30-60 Mbps on detail-heavy
+    #       content, much lower on uniform field footage
+    #   35-37: matches Pi's ~8 Mbps target for typical content
+    #   40+: noticeable quality drop
+    encoder_quality_qp: 30
   streaming:
     enabled: false
     platform: youtube
     rtmp_url: ''
     stream_key: ''
+    # 720p15 default tuned for YouTube.
     bitrate_kbps: 2500
     flow_check_grace_s: 10
+    # Streaming HUD renderer.
+    #   - `nv12_native` (default) - `aicamnv12overlay` writes the
+    #     scoreboard directly into NV12 planes; encoder consumes NV12
+    #     with no `videoconvert` bracket. Requires
+    #     /opt/aicam-extra-plugins/libaicam_broadcast_overlay.so.
+    #     Falls back to cairo at /streaming/start when the `.so`
+    #     isn't loadable.
+    #   - `cairo` - legacy `cairooverlay` + two `videoconvert` calls
+    #     (Pi) or dual-`nvvidconv` bracket (Jetson). Used as the
+    #     fallback path and as the explicit Jetson default until the
+    #     NV12-native path is field-validated on
+    #     nvarguscamerasrc + nvv4l2h264enc.
+    overlay_renderer: nv12_native
+    # Optional sizing override for the NV12-native overlay. When
+    # omitted, the plugin uses `LayoutSizes::default()`. Schema
+    # matches `aicam_broadcast_overlay::layout::LayoutSizes`; populated
+    # from this YAML node and pushed once at /streaming/start via the
+    # `layout-sizes-json` GObject property.
+    # overlay_layout:
+    #   row_height: 64
+    #   font_size: 28
 
 audio:
   device: default
@@ -63,5 +168,40 @@ audio:
 
 ai:
   accelerator: hailo
-  object_detection_model: RoboCup HSL Objects 1408x800 YOLO26s (Hailo-10H)
-  cpu_object_detection_model: RoboCup Landmarks 1920x1088 - YOLO26s (CPU)
+  # Operator selects the actual model in the Configuration page UI.
+  object_detection_model: null
+  cpu_object_detection_model: null
+
+# GameController telemetry. The control_api lifespan starts a
+# synthetic GC TestSource in a background thread when gc_test_mode is
+# true - useful for overlay validation when no real GameController is on
+# the LAN. Set false in production; consumers receive live UDP packets
+# via apps.telemetry_service.gamecontroller.GameControllerListener.
+telemetry:
+  game_controller_port: 3838
+  gc_test_mode: false
+
+# Per-host hardware platform. Defaults to Pi 5 + Hailo so configs
+# without this section keep working byte-for-byte. On
+# `platform: jetson` the AI features are force-disabled (no Hailo on
+# Jetson Nano; CPU detection isn't practical on a 4 GB Nano) and the
+# media service routes camera + encoder elements via `camera_backend`
+# and `video_encoder`.
+deployment:
+  platform: pi
+  camera_backend: libcamera
+  video_encoder: x264
+
+# Jetson Nano example stanza - copy the three deployment lines
+# below to override the Pi defaults on a Jetson host. Also set
+# `audio.device: plughw:CARD=Device` (USB sound card) to skip the
+# Tegra virtual ADMAIF mixer, which advertises capture capability
+# but has no real microphone wired to it on the dev kit. Operators
+# using a different USB sound card edit `audio.device` per host.
+#
+# deployment:
+#   platform: jetson
+#   camera_backend: nvargus
+#   video_encoder: nvv4l2_h264
+# audio:
+#   device: plughw:CARD=Device

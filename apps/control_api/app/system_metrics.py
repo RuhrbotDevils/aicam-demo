@@ -18,6 +18,11 @@ MONITORED_SERVICES = [
     "ai-cam-media",
     "ai-cam-control-api",
     "ai-cam-zmq-broker",
+    # ai-cam-cpu-detector intentionally absent: in the demo build the
+    # CPU detector runs on-demand from /api/v1/detection/cpu_snap, so
+    # the systemd service is disabled and would always show "stopped"
+    # in the dashboard Services list. Operators wanting to flip it on
+    # for development can still `systemctl start` it manually.
 ]
 
 
@@ -181,10 +186,13 @@ def _hailo_temp() -> tuple[float | None, float | None]:
 def _hailo_temp_via_pyhailort() -> tuple[float | None, float | None]:
     """Read chip temperatures using the HailoRT Python API.
 
-    On HailoRT 5.1.1 (Hailo-10H on Pi 5), the documented control
-    surface is `device.control.get_chip_temperature()` - NOT
-    `device.get_chip_temperature()` directly. The returned
-    `TemperatureInfo` exposes `ts0_temperature` and
+    HailoRT 5.1.x (Hailo-10H on Pi 5) exposes the temperature query as
+    ``device.control.get_chip_temperature()``. Older HailoRT releases
+    used ``device.get_chip_temperature()`` directly. Walk both
+    surfaces so the same code works across versions: prefer the 5.1.x
+    path, fall back to the older one.
+
+    The returned `TemperatureInfo` exposes `ts0_temperature` and
     `ts1_temperature` (the chip has two on-die thermistors).
     """
     try:
@@ -193,24 +201,47 @@ def _hailo_temp_via_pyhailort() -> tuple[float | None, float | None]:
         return None, None
     try:
         # Device() with no args picks the first scanned device.
-        # `device.control.get_chip_temperature()` is a control-plane
-        # query and does not require exclusive access - it works
-        # alongside `hailonet` running inference via the runtime
-        # scheduler.
+        # `get_chip_temperature()` is a control-plane query and does
+        # not require exclusive access - it works alongside `hailonet`
+        # running inference via the runtime scheduler.
         device = Device()
         try:
-            info = device.control.get_chip_temperature()
-            ts0 = float(info.ts0_temperature) if info.ts0_temperature is not None else None
-            ts1 = float(info.ts1_temperature) if info.ts1_temperature is not None else None
-            return ts0, ts1
+            info = _call_chip_temperature(device)
         finally:
             try:
                 device.release()
             except Exception:  # noqa: BLE001
                 pass
+        if info is None:
+            return None, None
+        ts0 = float(info.ts0_temperature) if info.ts0_temperature is not None else None
+        ts1 = float(info.ts1_temperature) if info.ts1_temperature is not None else None
+        return ts0, ts1
     except Exception as e:  # noqa: BLE001
         logger.debug("hailo temperature via pyhailort failed: %s", e)
         return None, None
+
+
+def _call_chip_temperature(device: Any) -> Any:
+    """Invoke get_chip_temperature on whichever HailoRT API path exists.
+
+    HailoRT 5.1.x uses ``device.control.get_chip_temperature``; older
+    releases use ``device.get_chip_temperature``. Returns the raw
+    struct (or ``None`` if neither path is callable).
+
+    Typed as ``Any`` because both the device handle and the returned
+    struct are dynamic surfaces from the optional ``hailo_platform``
+    extension.
+    """
+    control = getattr(device, "control", None)
+    if control is not None:
+        fn = getattr(control, "get_chip_temperature", None)
+        if callable(fn):
+            return fn()
+    fn = getattr(device, "get_chip_temperature", None)
+    if callable(fn):
+        return fn()
+    return None
 
 
 def _hailo_temp_via_cli() -> tuple[float | None, float | None]:
@@ -253,7 +284,7 @@ def _parse_cli_temp(text: str, pattern: str) -> float | None:
 
 # Pi 5: PMIC ADC channel BATT_V is the RTC backup battery. With a
 # healthy CR2032-class cell installed and the trickle charger
-# configured, voltage sits in the 2.9–3.1 V range. Without a battery
+# configured, voltage sits in the 2.9-3.1 V range. Without a battery
 # the channel reads close to 0 V; below 3.0 V indicates the cell is
 # discharged or the contact is bad. The Pi will still boot and run,
 # but the RTC won't keep time across power loss - surface this as a

@@ -1,5 +1,5 @@
 {
-    "display_name": "RoboCup HSL Objects 1408x800 YOLO26s (Hailo-10H)",
+    "display_name": "YOLO26s 1408 Objects RoboCup HSL (Hailo-10H)",
     "id": "yolo26s_rc_1408",
     "scope": "object_detection",
     "active": true,
@@ -19,6 +19,6 @@
         "robot",
         "human"
     ],
-    "notes": "RoboCup trained model at 1408x800 — Pareto-best cell for cascade mAP@0.5:0.05:0.95 / total-latency trade-off. 3 Classes: Ball, Robot, Human. Requires the in-tree libyolo26_post.so postprocess library.",
+    "notes": "RoboCup trained model at 1408x800 - Pareto-best cell for cascade mAP@0.5:0.05:0.95 / total-latency trade-off. 3 Classes: Ball, Robot, Human. Requires the in-tree libyolo26_post.so postprocess library.",
     "inference_fps": 7
 }

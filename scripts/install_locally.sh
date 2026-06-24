@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install_locally.sh - set up the AICam.demo runtime on the host
-# this script is run from.
-# Use this when the repository has been cloned onto a Pi and you want to
+# this script is run from. Use this when the repository has been
+# cloned onto a Pi (or any Debian-based machine) and you want to
 # install everything in place - apt deps, Python venv, Rust media
 # service binary, Hailo postprocess libs, systemd units, config -
 # from a single command.
@@ -126,12 +126,30 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
+# Step 4b - NV12-native overlay plugin
+# (before systemd install so the GST_PLUGIN_PATH drop-in is in place
+# when the media service is restarted)
+# ---------------------------------------------------------------------------
+echo "--- Step 4b: NV12-native overlay plugin ---"
+if [ "$NO_BUILD" -eq 1 ]; then
+    aicam_step_skipped "Overlay plugin build (--no-build)"
+elif ! aicam_have_cargo; then
+    aicam_step_skipped "Overlay plugin build (cargo not available)"
+else
+    aicam_build_install_overlay_plugin "$DEPLOY_PATH"
+    case "$?" in
+        0) aicam_step_done    "broadcast_overlay plugin built + installed (GST_PLUGIN_PATH drop-in)" ;;
+        2) aicam_step_skipped "Overlay plugin (crate not present)" ;;
+        *) aicam_step_fail    "Overlay plugin build/install failed - streaming falls back to cairo" ;;
+    esac
+fi
+echo ""
+
+# ---------------------------------------------------------------------------
 # Step 5 - Hailo postprocess libraries
 # ---------------------------------------------------------------------------
 echo "--- Step 5: Hailo postprocess libraries ---"
-aicam_build_hailo_postprocess "$DEPLOY_PATH"
-rc=$?
-case "$rc" in
+case "$(aicam_build_hailo_postprocess "$DEPLOY_PATH"; echo $?)" in
     0) aicam_step_done    "Hailo postprocess libraries built" ;;
     2) aicam_step_skipped "Hailo postprocess libraries (no Makefile)" ;;
     *) aicam_step_fail    "Hailo postprocess build failed" ;;
@@ -151,40 +169,18 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 7 - Kiosk autostart on boot
+# Step 7 - /opt sidecar symlinks
 # ---------------------------------------------------------------------------
-echo "--- Step 7: Kiosk autostart ---"
-_kiosk_script="$DEPLOY_PATH/scripts/run_kiosk.sh"
-if [ -f "$_kiosk_script" ]; then
-    if mkdir -p "$HOME/.config/labwc" && cat > "$HOME/.config/labwc/autostart" <<KIOSKEOF
-$_kiosk_script &
-KIOSKEOF
-        chmod +x "$HOME/.config/labwc/autostart"
-    then
-        aicam_step_done "Kiosk autostart configured (labwc)"
-    else
-        aicam_step_skipped "Kiosk autostart (labwc config write failed)"
-    fi
-else
-    aicam_step_skipped "Kiosk autostart (run_kiosk.sh not found)"
-fi
+echo "--- Step 7: /opt sidecar path symlinks ---"
+aicam_setup_opt_symlinks "$DEPLOY_PATH"
+aicam_step_done "/opt sidecar symlinks (created or already in place)"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 8 - setup model sidecar links
+# Step 8 - Systemd unit files
 # ---------------------------------------------------------------------------
-echo "--- Step 8: setup model sidecar links ---"
-aicam_setup_model_sidecars "$DEPLOY_PATH"
-aicam_step_done "setup model sidecar links done"
-echo ""
-
-# ---------------------------------------------------------------------------
-# Step 9 - Systemd unit files
-# ---------------------------------------------------------------------------
-echo "--- Step 9: Systemd unit files ---"
-aicam_install_systemd_units "$DEPLOY_PATH" "$TARGET_USER"
-rc=$?
-case "$rc" in
+echo "--- Step 8: Systemd unit files ---"
+case "$(aicam_install_systemd_units "$DEPLOY_PATH" "$TARGET_USER"; echo $?)" in
     0) aicam_step_done    "Systemd unit files installed; cpu-detector disabled; main services restarted" ;;
     2) aicam_step_skipped "Systemd units (no templates found)" ;;
     *) aicam_step_fail    "Systemd unit installation failed" ;;
@@ -192,14 +188,74 @@ esac
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 10 - config.yaml
+# Step 9 - config.yaml
 # ---------------------------------------------------------------------------
-echo "--- Step 10: config.yaml ---"
+echo "--- Step 9: config.yaml ---"
 if aicam_bootstrap_config_yaml "$DEPLOY_PATH" "$NODE_ID"; then
     aicam_step_done "config.yaml node.id set to $NODE_ID"
 else
     aicam_step_fail "config.yaml bootstrap failed"
 fi
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 10 - Inbound firewall (needs venv + config.yaml from above)
+# ---------------------------------------------------------------------------
+echo "--- Step 10: Inbound firewall ---"
+if aicam_setup_firewall "$DEPLOY_PATH" "$TARGET_USER"; then
+    aicam_step_done "Inbound firewall applied + sudoers drop-in installed"
+else
+    aicam_step_fail "Firewall setup failed - re-run scripts/apply_firewall_rules.py"
+fi
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 11 - Kiosk autostart (desktop only; no-op when headless)
+# ---------------------------------------------------------------------------
+echo "--- Step 11: Kiosk autostart ---"
+aicam_setup_kiosk_autostart "$DEPLOY_PATH"
+case "$?" in
+    0) aicam_step_done    "Kiosk autostart configured (labwc)" ;;
+    *) aicam_step_skipped "Kiosk autostart (run_kiosk.sh not found)" ;;
+esac
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 12 - Desktop shortcut to relaunch the kiosk UI
+# ---------------------------------------------------------------------------
+echo "--- Step 12: Desktop shortcut ---"
+aicam_install_desktop_shortcut "$DEPLOY_PATH"
+case "$?" in
+    0) aicam_step_done    "Desktop shortcut installed (relaunch kiosk UI)" ;;
+    *) aicam_step_skipped "Desktop shortcut (run_kiosk.sh not found)" ;;
+esac
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 13 - Desktop wallpaper
+# ---------------------------------------------------------------------------
+echo "--- Step 13: Desktop wallpaper ---"
+aicam_set_desktop_wallpaper "$DEPLOY_PATH"
+case "$?" in
+    0) aicam_step_done    "Desktop wallpaper set" ;;
+    *) aicam_step_skipped "Desktop wallpaper (background image not found)" ;;
+esac
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 14 - Kernel / firmware tuning
+# ---------------------------------------------------------------------------
+echo "--- Step 14: Kernel / firmware tuning ---"
+aicam_kernel_firmware_tuning
+aicam_step_done "Kernel/firmware tuning applied (swappiness + USB current)"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 15 - Chromium profile lock cleanup
+# ---------------------------------------------------------------------------
+echo "--- Step 15: Chromium profile cleanup ---"
+aicam_clean_chromium_locks
+aicam_step_done "Chromium profile locks cleaned"
 echo ""
 
 # ---------------------------------------------------------------------------

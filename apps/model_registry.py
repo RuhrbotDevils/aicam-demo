@@ -51,14 +51,27 @@ class ModelScope(str, Enum):
     object_detection = "object_detection"
 
 
+# Per-family defaults for postprocess.so_path and
+# postprocess.function_name. A model JSON can omit those two fields and
+# the loader will fill them in from this table based on the required
+# output_format. Families listed here with ``None`` (or absent from the
+# table) must spell both fields out explicitly in the JSON or they
+# will fail validation.
+#
+# `filter_letterbox` is the generic TAPPAS entry point that regex-
+# matches any ``nms_postprocess`` tensor. It works for every NMS-baked
+# YOLO HEF regardless of the exact tensor name, which is why it's the
+# safer default than model-specific functions like ``yolov8m``.
 _TAPPAS_YOLO_SO = "/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libyolo_hailortpp_post.so"
-_YOLO26_SO = "/opt/robocup-ai-camera/apps/hailo_postprocess/libyolo26_post.so"
+_INTREE_YOLO26_SO = "/opt/robocup-ai-camera/apps/hailo_postprocess/libyolo26_post.so"
 
 FAMILY_DEFAULTS: dict[str, dict[str, str]] = {
     "yolov5": {"so_path": _TAPPAS_YOLO_SO, "function_name": "filter_letterbox"},
     "yolov8": {"so_path": _TAPPAS_YOLO_SO, "function_name": "filter_letterbox"},
     "yolox": {"so_path": _TAPPAS_YOLO_SO, "function_name": "filter_letterbox"},
-    "yolo26": {"so_path": _YOLO26_SO, "function_name": "yolo26"},
+    "yolo26": {"so_path": _INTREE_YOLO26_SO, "function_name": "yolo26"},
+    # ``custom`` has no defaults - the JSON must spell out so_path and
+    # function_name explicitly.
 }
 
 KNOWN_OUTPUT_FORMATS = set(FAMILY_DEFAULTS.keys()) | {"custom"}
@@ -96,6 +109,10 @@ class ModelDef(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     display_name: str = Field(min_length=1)
+    # Stable short-slug identifier to reference a model independently of
+    # display_name (which is UI-facing and may change). Optional for
+    # backwards-compat - sidecars without an id still load, but any code
+    # path selecting by id must tolerate None.
     id: str | None = None
     scope: ModelScope
     active: bool
@@ -109,6 +126,10 @@ class ModelDef(BaseModel):
     class_map: dict[str, str] | None = None
     inference_fps: float | None = None
     notes: str | None = None
+    # When False, the Rust pipeline skips the meta_export hailofilter
+    # for this model. Used by render-only models (e.g. pose
+    # estimation) whose post-process emits HailoLandmarks rather than
+    # plain detections - meta_export crashes walking that ROI shape.
     publish_detections: bool = True
 
 

@@ -50,7 +50,7 @@ The demo consists of several cooperating components:
   Provides configuration, orchestration, and system control via REST and WebSocket.
 
 * **CPU AI Worker** (`apps/ai_worker/cpu_detector.py`)
-  Performs object detection (field landmarks only) on CPU and publishes results.
+  Runs YOLO object detection on CPU (Ultralytics/PyTorch) and publishes results as a fallback when no Hailo accelerator is present.
 
 * **Model Registry** (`apps/model_registry.py`)
   Loads AI models from configuration files.
@@ -89,16 +89,20 @@ cd aicam-demo
 ./scripts/install_locally.sh --install-rust
 ```
 
-⏱️ **Estimated time:** 10–30 minutes depending on system performance.
+⏱️ **Estimated time:** 10-30 minutes depending on system performance.
 
 This script will:
 
 * Install required system packages
 * Create a Python virtual environment
 * Build the Rust media service
+* Build and install the NV12 broadcast-overlay GStreamer plugin
 * Build Hailo post-processing libraries
 * Set up configuration and model files
-* Install systemd services
+* Install and enable systemd services
+* Set up the inbound firewall (and the sudoers rule the UI uses to re-apply it)
+* Configure kiosk autostart, a desktop shortcut to relaunch the UI, and the desktop wallpaper
+* Apply Pi kernel/firmware tuning (USB current for the Hailo accelerator, swappiness)
 
 If Rust is already installed, you may omit `--install-rust`.
 
@@ -208,6 +212,6 @@ All system components were designed, reviewed, and validated by human developers
 
 ## License
 
-This software is licensed unter the GPL-3.0 license
+This software is licensed under the GPL-3.0 license
 
 ---

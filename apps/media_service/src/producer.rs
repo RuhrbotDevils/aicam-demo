@@ -10,7 +10,12 @@
 //!
 //! Channels:
 //! - [`VIDEO_CHANNEL`] (`"aicam-main"`)
-//! - [`AUDIO_CHANNEL`] (`"aicam-audio-main"`)
+//! - [`AUDIO_CHANNEL_RECORDING`] (`"aicam-audio-rec"`) - recording consumer
+//! - [`AUDIO_CHANNEL_STREAMING`] (`"aicam-audio-stream"`) - streaming consumer
+//!
+//! The audio channel is split per consumer because `interaudiosrc`
+//! drains the surface adapter destructively - see the constant's
+//! docstring for the rationale.
 //!
 //! Only **one producer active at a time**. `intervideosink` does not
 //! arbitrate competing producers (last-writer-wins, frames interleave)
@@ -31,10 +36,116 @@ use tracing::{info, warn};
 /// `intervideosrc(channel=…)`.
 pub const VIDEO_CHANNEL: &str = "aicam-main";
 
-/// Inter-pipeline audio channel name. Producers publish via
-/// `interaudiosink(channel=…)`, consumers subscribe via
-/// `interaudiosrc(channel=…)`.
-pub const AUDIO_CHANNEL: &str = "aicam-audio-main";
+/// Inter-pipeline channel name for the recording consumer's audio.
+///
+/// **Why split per consumer (vs. one shared channel)**:
+/// `gst-plugins-bad`'s `interaudiosrc` *destructively* takes from
+/// the shared `GstInterSurface::audio_adapter` - see
+/// `gst_adapter_take_buffer` in `gstinteraudiosrc.c`. With two
+/// consumers reading the same channel, they race to consume; each
+/// gets ~half the bytes, and `interaudiosrc` prepends silence to
+/// its output to fill the gap. The recording then plays back as
+/// audio chopped up with silence - the "distortion when streaming
+/// starts" failure mode.
+///
+/// We fix this by tee-ing the producer's audio chain once and
+/// writing each branch into its own `aicam-audio-*` channel, so
+/// every consumer's `interaudiosrc` has a dedicated adapter to
+/// drain.
+pub const AUDIO_CHANNEL_RECORDING: &str = "aicam-audio-rec";
+
+/// Inter-pipeline channel name for the streaming consumer's audio.
+/// See [`AUDIO_CHANNEL_RECORDING`] for the per-consumer-channel
+/// rationale.
+pub const AUDIO_CHANNEL_STREAMING: &str = "aicam-audio-stream";
+
+/// Which GStreamer source element the live producer uses.
+///
+/// `Libcamera` (the existing Pi path) uses `libcamerasrc`. `Nvargus`
+/// (the Jetson CSI path) uses `nvarguscamerasrc` plus an `nvvidconv`
+/// bridge from NVMM to system memory because `intervideosink` cannot
+/// consume NVMM buffers. `V4l2` (generic USB cameras / future
+/// hardware) uses `v4l2src`. Every variant falls back to
+/// `videotestsrc` when the configured source element isn't
+/// registered with GStreamer - this lets the dev container build
+/// the pipeline for unit tests on any backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraBackend {
+    Libcamera,
+    Nvargus,
+    V4l2,
+}
+
+/// Combined producer-side orientation derived from the
+/// two config flags `camera.flip_horizontal` + `camera.rotate_180`.
+///
+/// The four (rotate_180, flip_horizontal) combinations each map to
+/// a single `videoflip` / `nvvidconv flip-method` enum value, so
+/// the producer never needs more than one transform element (or
+/// one VIC pass on Tegra) regardless of how the operator wants the
+/// frames oriented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orientation {
+    /// No transform; the renderer skips the element entirely on
+    /// the CPU path and leaves the existing nvvidconv's
+    /// `flip-method` at its default on the Nvargus path.
+    Identity,
+    /// Mirror left↔right only. Top/bottom unchanged.
+    HorizontalFlip,
+    /// 180° rotation - equivalent to flipping both axes.
+    Rotate180,
+    /// 180° + horizontal-flip - equivalent to a vertical-only
+    /// flip (top↔bottom, sides unchanged). Tegra exposes this as
+    /// a distinct `flip-method` value (a single VIC op) and so
+    /// does CPU `videoflip`.
+    VerticalFlip,
+}
+
+impl Orientation {
+    /// Map the two config booleans to a single enum.
+    pub fn from_flags(flip_horizontal: bool, rotate_180: bool) -> Self {
+        match (rotate_180, flip_horizontal) {
+            (false, false) => Self::Identity,
+            (false, true) => Self::HorizontalFlip,
+            (true, false) => Self::Rotate180,
+            (true, true) => Self::VerticalFlip,
+        }
+    }
+
+    /// GEnum nickname string accepted by both `videoflip method`
+    /// and `nvvidconv flip-method`. `None` for `Identity` - the
+    /// caller skips the element / leaves the property at its
+    /// default in that case.
+    pub fn method_str(self) -> Option<&'static str> {
+        match self {
+            Self::Identity => None,
+            Self::HorizontalFlip => Some("horizontal-flip"),
+            Self::Rotate180 => Some("rotate-180"),
+            Self::VerticalFlip => Some("vertical-flip"),
+        }
+    }
+}
+
+impl CameraBackend {
+    /// Parse the `deployment.camera_backend` string from `config.yaml`.
+    /// Unknown values warn and fall back to `Libcamera` so a typo in
+    /// the deployment script doesn't take the box down - the pipeline
+    /// still builds against the (likely correct on Pi) default.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "libcamera" => Self::Libcamera,
+            "nvargus" => Self::Nvargus,
+            "v4l2" => Self::V4l2,
+            other => {
+                warn!(
+                    value = %other,
+                    "CameraBackend::parse: unknown value, falling back to libcamera"
+                );
+                Self::Libcamera
+            }
+        }
+    }
+}
 
 /// Build the **live** producer pipeline.
 ///
@@ -49,7 +160,7 @@ pub const AUDIO_CHANNEL: &str = "aicam-audio-main";
 /// alsasrc (or audiotestsrc fallback)
 ///   → audioconvert
 ///   → capsfilter(S16LE, 48 kHz, 2 ch, interleaved)
-///   → interaudiosink(channel="aicam-audio-main")
+///   → interaudiosink(channel="aicam-audio-{rec,stream}")
 /// ```
 ///
 /// `intervideosink` / `interaudiosink` are configured with
@@ -62,12 +173,15 @@ pub const AUDIO_CHANNEL: &str = "aicam-audio-main";
 /// Returns the unstarted pipeline (caller transitions to PLAYING via
 /// `set_state`). The audio sub-pipeline is added in the same
 /// `gst::Pipeline` so the bus is shared.
+#[allow(clippy::too_many_arguments)]
 pub fn build_live_producer_pipeline(
     width: u32,
     height: u32,
     fps: u32,
     audio_enabled: bool,
     audio_device: Option<&str>,
+    camera_backend: CameraBackend,
+    orientation: Orientation,
 ) -> anyhow::Result<gst::Pipeline> {
     gst::init()?;
 
@@ -75,40 +189,19 @@ pub fn build_live_producer_pipeline(
         .name("live_producer_pipeline")
         .build();
 
-    // --- Video chain ---
-    let video_src = make_video_source("live_producer_video_src")?;
-
-    let video_capsfilter = gst::ElementFactory::make("capsfilter")
-        .name("live_producer_video_caps")
-        .build()?;
-    let caps = gst::Caps::from_str(&format!(
-        "video/x-raw,width={width},height={height},format=NV12,framerate={fps}/1"
-    ))?;
-    video_capsfilter.set_property("caps", &caps);
-
-    let videoconvert = gst::ElementFactory::make("videoconvert")
-        .name("live_producer_videoconvert")
-        .build()?;
-
-    let intervideosink = make_intervideosink("live_producer_intervideosink")?;
-
-    pipeline.add_many([
-        &video_src,
-        &video_capsfilter,
-        &videoconvert,
-        &intervideosink,
-    ])?;
-    gst::Element::link_many([
-        &video_src,
-        &video_capsfilter,
-        &videoconvert,
-        &intervideosink,
-    ])?;
+    // --- Video chain --- per-backend branching.
+    let video_elements = build_live_video_head(camera_backend, width, height, fps, orientation)?;
+    pipeline.add_many(&video_elements)?;
+    gst::Element::link_many(&video_elements)?;
 
     // --- Optional audio chain ---
     if audio_enabled {
         match build_live_audio_chain(&pipeline, audio_device) {
-            Ok(()) => info!(channel = AUDIO_CHANNEL, "live producer: audio chain built"),
+            Ok(()) => info!(
+                rec_channel = AUDIO_CHANNEL_RECORDING,
+                stream_channel = AUDIO_CHANNEL_STREAMING,
+                "live producer: audio chain built (tee → 2 sinks)"
+            ),
             Err(e) => warn!(error = %e, "live producer: audio chain failed - video-only"),
         }
     }
@@ -144,7 +237,7 @@ pub struct LiveProducer {
 /// Thin wrapper around [`build_live_producer_pipeline`]: the lower-level
 /// builder is best-effort on audio (alsasrc errors get swallowed and
 /// the chain is simply not added). This wrapper looks up the named
-/// `live_producer_interaudiosink` element to compute
+/// `live_producer_audio_tee` element to compute
 /// [`LiveProducer::audio_available`].
 ///
 /// The `ai_config` and `hailo_available` arguments are unused by
@@ -160,14 +253,30 @@ pub fn build_live_producer(
     fps: u32,
     audio_enabled: bool,
     audio_device: Option<&str>,
+    camera_backend: CameraBackend,
+    flip_horizontal: bool,
+    rotate_180: bool,
     _ai_config: &crate::pipeline::AiConfig,
     _hailo_available: bool,
 ) -> anyhow::Result<LiveProducer> {
-    let pipeline = build_live_producer_pipeline(width, height, fps, audio_enabled, audio_device)?;
-    let audio_available = pipeline.by_name("live_producer_interaudiosink").is_some();
+    let orientation = Orientation::from_flags(flip_horizontal, rotate_180);
+    let pipeline = build_live_producer_pipeline(
+        width,
+        height,
+        fps,
+        audio_enabled,
+        audio_device,
+        camera_backend,
+        orientation,
+    )?;
+    // The per-consumer audio tee is the canonical
+    // marker that the audio sub-pipeline came up (it sits upstream of
+    // both rec + stream sinks; if it's there, both branches were
+    // added too).
+    let audio_available = pipeline.by_name("live_producer_audio_tee").is_some();
     info!(
         audio_available,
-        "Live producer pipeline built - feeds aicam-main / aicam-audio-main"
+        "Live producer pipeline built - feeds aicam-main / aicam-audio-{{rec,stream}}"
     );
     Ok(LiveProducer {
         pipeline,
@@ -179,6 +288,20 @@ fn build_live_audio_chain(
     pipeline: &gst::Pipeline,
     audio_device: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Tee the audio chain once and write into a dedicated
+    // interaudiosink per consumer.
+    //
+    //   alsasrc → audioconvert → caps → tee
+    //     ├── queue → interaudiosink(channel=aicam-audio-rec)
+    //     └── queue → interaudiosink(channel=aicam-audio-stream)
+    //
+    // Two interaudiosinks (one per consumer) instead of one shared
+    // channel - see the docstring on AUDIO_CHANNEL_RECORDING for why
+    // interaudiosrc cannot fan out from a single channel without
+    // chopping the audio into silence-padded shards. Each branch
+    // carries its own `queue` with `leaky=downstream` so an inactive
+    // consumer can't back-pressure alsasrc into starving the other
+    // branch - see `build_audio_fanout_branch`.
     let audio_src = make_audio_source("live_producer_audio_src", audio_device)?;
 
     let audioconvert = gst::ElementFactory::make("audioconvert")
@@ -196,20 +319,35 @@ fn build_live_audio_chain(
         .build();
     audio_capsfilter.set_property("caps", &audio_caps);
 
-    let interaudiosink = make_interaudiosink("live_producer_interaudiosink")?;
+    let audio_tee = gst::ElementFactory::make("tee")
+        .name("live_producer_audio_tee")
+        .build()?;
+    audio_tee.set_property("allow-not-linked", true);
+
+    let (rec_queue, rec_sink) = build_audio_fanout_branch(
+        "live_producer_audio_rec_queue",
+        "live_producer_audio_rec_sink",
+        AUDIO_CHANNEL_RECORDING,
+    )?;
+    let (stream_queue, stream_sink) = build_audio_fanout_branch(
+        "live_producer_audio_stream_queue",
+        "live_producer_audio_stream_sink",
+        AUDIO_CHANNEL_STREAMING,
+    )?;
 
     pipeline.add_many([
         &audio_src,
         &audioconvert,
         &audio_capsfilter,
-        &interaudiosink,
+        &audio_tee,
+        &rec_queue,
+        &rec_sink,
+        &stream_queue,
+        &stream_sink,
     ])?;
-    gst::Element::link_many([
-        &audio_src,
-        &audioconvert,
-        &audio_capsfilter,
-        &interaudiosink,
-    ])?;
+    gst::Element::link_many([&audio_src, &audioconvert, &audio_capsfilter, &audio_tee])?;
+    gst::Element::link_many([&audio_tee, &rec_queue, &rec_sink])?;
+    gst::Element::link_many([&audio_tee, &stream_queue, &stream_sink])?;
     Ok(())
 }
 
@@ -225,7 +363,7 @@ fn build_live_audio_chain(
 ///         → intervideosink(channel="aicam-main")
 ///       audio → audioconvert
 ///         → capsfilter(S16LE, 48 kHz, 2 ch, interleaved)
-///         → interaudiosink(channel="aicam-audio-main")
+///         → interaudiosink(channel="aicam-audio-{rec,stream}")
 /// ```
 ///
 /// `speed` follows the same semantics as the existing
@@ -333,10 +471,37 @@ pub fn build_playback_producer_pipeline(path: &Path, speed: f64) -> anyhow::Resu
         .field("layout", "interleaved")
         .build();
     audio_capsfilter.set_property("caps", &audio_caps);
-    let interaudiosink = make_interaudiosink("playback_producer_interaudiosink")?;
 
-    pipeline.add_many([&audio_convert, &audio_capsfilter, &interaudiosink])?;
-    gst::Element::link_many([&audio_convert, &audio_capsfilter, &interaudiosink])?;
+    // Mirror the live producer's tee fan-out so playback
+    // audio also drains into per-consumer channels. See
+    // `build_audio_fanout_branch` for the per-channel rationale.
+    let audio_tee = gst::ElementFactory::make("tee")
+        .name("playback_producer_audio_tee")
+        .build()?;
+    audio_tee.set_property("allow-not-linked", true);
+    let (rec_queue, rec_sink) = build_audio_fanout_branch(
+        "playback_producer_audio_rec_queue",
+        "playback_producer_audio_rec_sink",
+        AUDIO_CHANNEL_RECORDING,
+    )?;
+    let (stream_queue, stream_sink) = build_audio_fanout_branch(
+        "playback_producer_audio_stream_queue",
+        "playback_producer_audio_stream_sink",
+        AUDIO_CHANNEL_STREAMING,
+    )?;
+
+    pipeline.add_many([
+        &audio_convert,
+        &audio_capsfilter,
+        &audio_tee,
+        &rec_queue,
+        &rec_sink,
+        &stream_queue,
+        &stream_sink,
+    ])?;
+    gst::Element::link_many([&audio_convert, &audio_capsfilter, &audio_tee])?;
+    gst::Element::link_many([&audio_tee, &rec_queue, &rec_sink])?;
+    gst::Element::link_many([&audio_tee, &stream_queue, &stream_sink])?;
 
     // Wire decodebin pad-added → video-sink-chain or audio-sink-chain
     // by examining the new pad's caps.
@@ -605,18 +770,172 @@ pub type SharedProducerController = Arc<ProducerController>;
 
 // --- Element-factory helpers ---
 
-/// Try `libcamerasrc` first, fall back to `videotestsrc` for dev
-/// machines without a camera. Mirrors `build_live_producer`'s fallback.
-fn make_video_source(name: &str) -> anyhow::Result<gst::Element> {
-    if let Ok(src) = gst::ElementFactory::make("libcamerasrc").name(name).build() {
-        return Ok(src);
+/// Build the per-backend video head for the live producer.
+///
+/// Returns a `Vec<gst::Element>` in link order so the caller can do
+/// `pipeline.add_many(&v)?; gst::Element::link_many(&v)?;` regardless
+/// of which backend produced the chain. Last element is always the
+/// `intervideosink` so the producer/consumer boundary stays intact.
+///
+/// Each backend's primary source element is wrapped in a
+/// `videotestsrc` fallback so the dev container (no camera) can
+/// still build the pipeline for unit tests. The fallback emits the
+/// same caps the primary source would produce, just synthetic.
+fn build_live_video_head(
+    backend: CameraBackend,
+    width: u32,
+    height: u32,
+    fps: u32,
+    orientation: Orientation,
+) -> anyhow::Result<Vec<gst::Element>> {
+    // Shared sink - every backend feeds the same inter-pipeline
+    // channel so consumers don't see the backend swap.
+    let make_sink = || make_intervideosink("live_producer_intervideosink");
+
+    // Shared raw-NV12 capsfilter (system memory). Used as the final
+    // caps step before intervideosink for every backend.
+    let raw_caps = gst::Caps::from_str(&format!(
+        "video/x-raw,format=NV12,width={},height={},framerate={}/1",
+        width, height, fps
+    ))?;
+    let make_raw_capsfilter = |name: &str| -> anyhow::Result<gst::Element> {
+        let cf = gst::ElementFactory::make("capsfilter").name(name).build()?;
+        cf.set_property("caps", &raw_caps);
+        Ok(cf)
+    };
+
+    // videotestsrc fallback used by every backend so the dev
+    // container builds without a real camera. Pattern + live flag
+    // match what the Pi-only path used previously.
+    let testsrc_fallback = |label: &str| -> anyhow::Result<gst::Element> {
+        warn!(
+            backend = ?backend,
+            "live producer: source unavailable ({label}), falling back to videotestsrc"
+        );
+        let src = gst::ElementFactory::make("videotestsrc")
+            .name("live_producer_video_src")
+            .build()?;
+        src.set_property_from_str("pattern", "ball");
+        src.set_property("is-live", true);
+        Ok(src)
+    };
+
+    // Build a videoflip element when the
+    // operator opted in to any orientation other than Identity.
+    // CPU path used by Libcamera / V4l2 / videotestsrc fallback
+    // paths; the Nvargus real path folds the flip into the
+    // existing nvvidconv via `flip-method=<…>` (Tegra VIC, zero
+    // CPU) below. The method enum value is shared between the
+    // CPU videoflip and Tegra nvvidconv flip-method properties.
+    let videoflip_method = orientation.method_str();
+    let make_videoflip = || -> anyhow::Result<gst::Element> {
+        let flip = gst::ElementFactory::make("videoflip")
+            .name("live_producer_video_flip")
+            .build()?;
+        if let Some(m) = videoflip_method {
+            flip.set_property_from_str("method", m);
+        }
+        Ok(flip)
+    };
+
+    match backend {
+        CameraBackend::Libcamera => {
+            // libcamerasrc → caps NV12 → [videoflip] → videoconvert → intervideosink
+            let src = gst::ElementFactory::make("libcamerasrc")
+                .name("live_producer_video_src")
+                .build()
+                .or_else(|_| testsrc_fallback("libcamerasrc"))?;
+            let cf = make_raw_capsfilter("live_producer_video_caps")?;
+            let cv = gst::ElementFactory::make("videoconvert")
+                .name("live_producer_videoconvert")
+                .build()?;
+            let mut elements: Vec<gst::Element> = vec![src, cf];
+            if videoflip_method.is_some() {
+                elements.push(make_videoflip()?);
+            }
+            elements.push(cv);
+            elements.push(make_sink()?);
+            Ok(elements)
+        }
+        CameraBackend::Nvargus => {
+            // On a real Jetson: nvarguscamerasrc → caps NVMM NV12 →
+            // nvvidconv → caps NV12 raw → intervideosink. The
+            // nvvidconv bridge is mandatory because intervideosink
+            // can't consume NVMM-resident buffers.
+            //
+            // On the dev container neither nvarguscamerasrc nor
+            // nvvidconv are registered, so we explicitly fall back to
+            // the libcamera-shaped simple chain. (The videotestsrc
+            // fallback can't produce NVMM caps, so we have to detect
+            // the fallback path and drop the NVMM caps step entirely.)
+            if let Ok(src) = gst::ElementFactory::make("nvarguscamerasrc")
+                .name("live_producer_video_src")
+                .build()
+            {
+                let nvmm_caps = gst::Caps::from_str(&format!(
+                    "video/x-raw(memory:NVMM),format=NV12,width={},height={},framerate={}/1",
+                    width, height, fps
+                ))?;
+                let nvmm_capsfilter = gst::ElementFactory::make("capsfilter")
+                    .name("live_producer_video_nvmm_caps")
+                    .build()?;
+                nvmm_capsfilter.set_property("caps", &nvmm_caps);
+                let nvconv = gst::ElementFactory::make("nvvidconv")
+                    .name("live_producer_video_nvvidconv")
+                    .build()?;
+                if let Some(m) = videoflip_method {
+                    // Tegra VIC does the
+                    // flip / rotation on the existing NVMM-NV12 →
+                    // system-NV12 download - no extra pass, no CPU
+                    // cost. `flip-method` accepts the same enum
+                    // nicknames as videoflip's `method`
+                    // (horizontal-flip, rotate-180, vertical-flip).
+                    nvconv.set_property_from_str("flip-method", m);
+                }
+                let raw_capsfilter = make_raw_capsfilter("live_producer_video_caps")?;
+                Ok(vec![
+                    src,
+                    nvmm_capsfilter,
+                    nvconv,
+                    raw_capsfilter,
+                    make_sink()?,
+                ])
+            } else {
+                // Dev container fallback. Same CPU-flip shape as
+                // Libcamera since videotestsrc can't produce NVMM.
+                let src = testsrc_fallback("nvarguscamerasrc")?;
+                let cf = make_raw_capsfilter("live_producer_video_caps")?;
+                let cv = gst::ElementFactory::make("videoconvert")
+                    .name("live_producer_videoconvert")
+                    .build()?;
+                let mut elements: Vec<gst::Element> = vec![src, cf];
+                if videoflip_method.is_some() {
+                    elements.push(make_videoflip()?);
+                }
+                elements.push(cv);
+                elements.push(make_sink()?);
+                Ok(elements)
+            }
+        }
+        CameraBackend::V4l2 => {
+            // v4l2src → caps NV12 → [videoflip] → videoconvert → intervideosink
+            let src = gst::ElementFactory::make("v4l2src")
+                .name("live_producer_video_src")
+                .build()
+                .or_else(|_| testsrc_fallback("v4l2src"))?;
+            let cf = make_raw_capsfilter("live_producer_video_caps")?;
+            let cv = gst::ElementFactory::make("videoconvert")
+                .name("live_producer_videoconvert")
+                .build()?;
+            let mut elements: Vec<gst::Element> = vec![src, cf];
+            if videoflip_method.is_some() {
+                elements.push(make_videoflip()?);
+            }
+            elements.push(cv);
+            elements.push(make_sink()?);
+            Ok(elements)
+        }
     }
-    warn!("libcamerasrc not available, falling back to videotestsrc");
-    let src = gst::ElementFactory::make("videotestsrc")
-        .name(name)
-        .build()?;
-    src.set_property_from_str("pattern", "ball");
-    Ok(src)
 }
 
 /// Try `alsasrc` (with optional device), fall back to
@@ -648,15 +967,40 @@ fn make_intervideosink(name: &str) -> anyhow::Result<gst::Element> {
     Ok(sink)
 }
 
-fn make_interaudiosink(name: &str) -> anyhow::Result<gst::Element> {
-    let sink = gst::ElementFactory::make("interaudiosink")
-        .name(name)
+/// One branch off the producer's audio tee:
+/// `queue (leaky=downstream, max-size-time=200 ms) → interaudiosink(channel)`.
+///
+/// `leaky=downstream` lets the branch silently drop audio when the
+/// consumer on the other end of the channel is inactive (e.g. when
+/// streaming hasn't been started yet). Without it, the queue would
+/// fill, back-pressure alsasrc, and the *other* branch's audio would
+/// stall too - leaving recording's audio choppy whenever the
+/// streaming side wasn't draining.
+///
+/// 200 ms is well above the interaudiosink's own surface flush
+/// threshold (`buffer-time`, default 200 ms) so the queue normally
+/// stays empty; it's only there as a leak relief valve.
+fn build_audio_fanout_branch(
+    queue_name: &str,
+    sink_name: &str,
+    channel: &str,
+) -> anyhow::Result<(gst::Element, gst::Element)> {
+    let queue = gst::ElementFactory::make("queue")
+        .name(queue_name)
         .build()?;
-    sink.set_property("channel", AUDIO_CHANNEL);
+    queue.set_property_from_str("leaky", "downstream");
+    queue.set_property("max-size-time", 200_000_000u64);
+    queue.set_property("max-size-buffers", 0u32);
+    queue.set_property("max-size-bytes", 0u32);
+
+    let sink = gst::ElementFactory::make("interaudiosink")
+        .name(sink_name)
+        .build()?;
+    sink.set_property("channel", channel);
     sink.set_property("sync", true);
     sink.set_property("async", false);
     sink.set_property("enable-last-sample", false);
-    Ok(sink)
+    Ok((queue, sink))
 }
 
 #[cfg(test)]
@@ -681,7 +1025,211 @@ mod tests {
     fn channel_constants_are_stable() {
         // Stable channel names - consumer pipelines depend on them.
         assert_eq!(VIDEO_CHANNEL, "aicam-main");
-        assert_eq!(AUDIO_CHANNEL, "aicam-audio-main");
+        assert_eq!(AUDIO_CHANNEL_RECORDING, "aicam-audio-rec");
+        assert_eq!(AUDIO_CHANNEL_STREAMING, "aicam-audio-stream");
+    }
+
+    /// Every backend builds in the dev container - the
+    /// fallback chain works for every backend.
+    #[test]
+    fn live_builder_constructs_for_every_camera_backend() {
+        init_gst();
+        for backend in [
+            CameraBackend::Libcamera,
+            CameraBackend::Nvargus,
+            CameraBackend::V4l2,
+        ] {
+            let pipeline = build_live_producer_pipeline(
+                640,
+                480,
+                30,
+                false,
+                None,
+                backend,
+                Orientation::Identity,
+            )
+            .unwrap_or_else(|e| panic!("live builder failed for {backend:?}: {e}"));
+            assert!(
+                pipeline.by_name("live_producer_intervideosink").is_some(),
+                "{backend:?}: intervideosink must exist",
+            );
+            let _ = pipeline.set_state(gst::State::Null);
+        }
+    }
+
+    /// Parse defaults to Libcamera on unknown so a typo in
+    /// the deployment script can't take the box down - the (likely
+    /// correct on Pi) default still produces a pipeline.
+    #[test]
+    fn camera_backend_parse_table() {
+        assert_eq!(CameraBackend::parse("libcamera"), CameraBackend::Libcamera);
+        assert_eq!(CameraBackend::parse("nvargus"), CameraBackend::Nvargus);
+        assert_eq!(CameraBackend::parse("v4l2"), CameraBackend::V4l2);
+        assert_eq!(CameraBackend::parse("typo"), CameraBackend::Libcamera);
+        assert_eq!(CameraBackend::parse(""), CameraBackend::Libcamera);
+    }
+
+    /// With `flip_horizontal: false` (the default), the
+    /// producer pipeline must be byte-identical to the default path - no
+    /// `live_producer_video_flip` element inserted, no extra cap step.
+    /// This is the **must-not-degrade-performance** path.
+    #[test]
+    fn live_builder_flip_off_inserts_no_videoflip() {
+        init_gst();
+        for backend in [
+            CameraBackend::Libcamera,
+            CameraBackend::Nvargus,
+            CameraBackend::V4l2,
+        ] {
+            let pipeline = build_live_producer_pipeline(
+                640,
+                480,
+                30,
+                false,
+                None,
+                backend,
+                Orientation::Identity,
+            )
+            .unwrap_or_else(|e| panic!("flip-off builder failed for {backend:?}: {e}"));
+            assert!(
+                pipeline.by_name("live_producer_video_flip").is_none(),
+                "{backend:?}: videoflip must NOT be inserted when flip_horizontal=false"
+            );
+            let _ = pipeline.set_state(gst::State::Null);
+        }
+    }
+
+    /// With `flip_horizontal: true`, the Libcamera path
+    /// inserts a `videoflip method=horizontal-flip` element between
+    /// the source-side caps and `videoconvert`. (The Nvargus real
+    /// path uses `nvvidconv flip-method=horizontal-flip` on the
+    /// existing converter and is only reachable on Tegra hardware -
+    /// the dev-container Nvargus path falls back to videotestsrc and
+    /// the CPU-flip shape, covered by the next test.)
+    #[test]
+    fn live_builder_flip_on_libcamera_inserts_videoflip() {
+        init_gst();
+        let pipeline = build_live_producer_pipeline(
+            640,
+            480,
+            30,
+            false,
+            None,
+            CameraBackend::Libcamera,
+            Orientation::HorizontalFlip,
+        )
+        .expect("flip-on Libcamera build");
+        let flip = pipeline
+            .by_name("live_producer_video_flip")
+            .expect("videoflip must exist when flip_horizontal=true on Libcamera");
+        assert_eq!(flip.factory().unwrap().name(), "videoflip");
+        // method is a GEnum (GstVideoOrientationMethod). Read via
+        // property_value().serialize() to get the nick back and avoid
+        // a gstreamer-video dep just for the enum type.
+        let m = flip.property_value("method");
+        let nick = m.serialize().expect("serialize enum value");
+        assert_eq!(nick.as_str(), "horizontal-flip");
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+
+    /// The four (rotate_180, flip_horizontal)
+    /// combinations each map to a single videoflip / nvvidconv
+    /// flip-method enum value. This pins the mapping so a future
+    /// re-order doesn't silently break operator config.
+    #[test]
+    fn orientation_from_flags_table() {
+        assert_eq!(Orientation::from_flags(false, false), Orientation::Identity);
+        assert_eq!(
+            Orientation::from_flags(true, false),
+            Orientation::HorizontalFlip
+        );
+        assert_eq!(Orientation::from_flags(false, true), Orientation::Rotate180);
+        assert_eq!(
+            Orientation::from_flags(true, true),
+            Orientation::VerticalFlip
+        );
+    }
+
+    /// Each variant maps to the GEnum nickname accepted
+    /// by both `videoflip method` and `nvvidconv flip-method`.
+    /// Identity returns `None` so the renderer skips the element /
+    /// leaves the existing nvvidconv at its default.
+    #[test]
+    fn orientation_method_str_mapping() {
+        assert_eq!(Orientation::Identity.method_str(), None);
+        assert_eq!(
+            Orientation::HorizontalFlip.method_str(),
+            Some("horizontal-flip")
+        );
+        assert_eq!(Orientation::Rotate180.method_str(), Some("rotate-180"));
+        assert_eq!(
+            Orientation::VerticalFlip.method_str(),
+            Some("vertical-flip")
+        );
+    }
+
+    /// Producer inserts a single videoflip element with
+    /// the right method for each non-Identity orientation. (Real
+    /// Jetson uses the existing nvvidconv's flip-method property
+    /// instead - only reachable on Tegra hardware; covered by
+    /// operator validation.)
+    #[test]
+    fn live_builder_orientation_maps_to_videoflip_method() {
+        init_gst();
+        for (orientation, expected_nick) in [
+            (Orientation::HorizontalFlip, "horizontal-flip"),
+            (Orientation::Rotate180, "rotate-180"),
+            (Orientation::VerticalFlip, "vertical-flip"),
+        ] {
+            let pipeline = build_live_producer_pipeline(
+                640,
+                480,
+                30,
+                false,
+                None,
+                CameraBackend::Libcamera,
+                orientation,
+            )
+            .unwrap_or_else(|e| panic!("build failed for {orientation:?}: {e}"));
+            let flip = pipeline
+                .by_name("live_producer_video_flip")
+                .unwrap_or_else(|| panic!("videoflip element must exist for {orientation:?}"));
+            let nick = flip
+                .property_value("method")
+                .serialize()
+                .expect("serialize enum value");
+            assert_eq!(
+                nick.as_str(),
+                expected_nick,
+                "for orientation {orientation:?}"
+            );
+            let _ = pipeline.set_state(gst::State::Null);
+        }
+    }
+
+    /// Dev-container Nvargus falls back to videotestsrc
+    /// (no nvarguscamerasrc available), so the flip lands as a
+    /// `videoflip` element the same way Libcamera does. On real
+    /// Jetson the flip is folded into the existing nvvidconv via
+    /// `flip-method=4` (covered by hardware validation).
+    #[test]
+    fn live_builder_flip_on_nvargus_devcontainer_falls_back_to_videoflip() {
+        init_gst();
+        let pipeline = build_live_producer_pipeline(
+            640,
+            480,
+            30,
+            false,
+            None,
+            CameraBackend::Nvargus,
+            Orientation::HorizontalFlip,
+        )
+        .expect("flip-on Nvargus build (videotestsrc fallback)");
+        assert!(
+            pipeline.by_name("live_producer_video_flip").is_some(),
+            "dev-container Nvargus fallback must insert videoflip"
+        );
+        let _ = pipeline.set_state(gst::State::Null);
     }
 
     #[test]
@@ -690,8 +1238,16 @@ mod tests {
         // fall through to videotestsrc and still produce a valid
         // pipeline.
         init_gst();
-        let pipeline = build_live_producer_pipeline(1920, 1080, 30, false, None)
-            .expect("live producer (video-only) should build");
+        let pipeline = build_live_producer_pipeline(
+            1920,
+            1080,
+            30,
+            false,
+            None,
+            CameraBackend::Libcamera,
+            Orientation::Identity,
+        )
+        .expect("live producer (video-only) should build");
 
         // The intervideosink must exist on the channel.
         let sink = pipeline
@@ -707,17 +1263,35 @@ mod tests {
         // takes the audiotestsrc fallback path. The audio chain is
         // best-effort; we only assert the video chain is present.
         init_gst();
-        let pipeline = build_live_producer_pipeline(1920, 1080, 30, true, None)
-            .expect("live producer (with audio) should build");
+        let pipeline = build_live_producer_pipeline(
+            1920,
+            1080,
+            30,
+            true,
+            None,
+            CameraBackend::Libcamera,
+            Orientation::Identity,
+        )
+        .expect("live producer (with audio) should build");
 
         assert!(pipeline.by_name("live_producer_intervideosink").is_some());
-        // The audio interaudiosink should be present whenever the
-        // audio chain succeeded - it does in this dev environment via
-        // the audiotestsrc fallback.
-        let audio_sink = pipeline
-            .by_name("live_producer_interaudiosink")
-            .expect("audio interaudiosink must exist when audio chain was built");
-        assert_eq!(audio_sink.property::<String>("channel"), AUDIO_CHANNEL);
+        // The audio chain now has per-consumer interaudiosinks.
+        // Whenever the audio chain came up, both branches were added -
+        // assert both sinks exist on their respective channels.
+        let rec_sink = pipeline
+            .by_name("live_producer_audio_rec_sink")
+            .expect("audio rec sink must exist when audio chain was built");
+        assert_eq!(
+            rec_sink.property::<String>("channel"),
+            AUDIO_CHANNEL_RECORDING
+        );
+        let stream_sink = pipeline
+            .by_name("live_producer_audio_stream_sink")
+            .expect("audio stream sink must exist when audio chain was built");
+        assert_eq!(
+            stream_sink.property::<String>("channel"),
+            AUDIO_CHANNEL_STREAMING
+        );
     }
 
     #[test]
@@ -726,14 +1300,28 @@ mod tests {
         // without a real video output. PLAYING also needs a
         // consumer-side intervideosrc.
         init_gst();
-        let pipeline = build_live_producer_pipeline(640, 480, 30, false, None)
-            .expect("live producer should build");
+        let pipeline = build_live_producer_pipeline(
+            640,
+            480,
+            30,
+            false,
+            None,
+            CameraBackend::Libcamera,
+            Orientation::Identity,
+        )
+        .expect("live producer should build");
         let res = pipeline.set_state(gst::State::Paused);
         // `Async` is fine - preroll completes asynchronously.
+        // `NoPreroll` is the proper return for live sources
+        // (the videotestsrc fallback sets is-live=true to
+        // match the real libcamerasrc / nvarguscamerasrc / v4l2src
+        // behaviour); we only assert the state-change itself was OK.
         assert!(
             matches!(
                 res,
-                Ok(gst::StateChangeSuccess::Success | gst::StateChangeSuccess::Async)
+                Ok(gst::StateChangeSuccess::Success
+                    | gst::StateChangeSuccess::Async
+                    | gst::StateChangeSuccess::NoPreroll)
             ),
             "live producer must reach PAUSED, got {res:?}"
         );
@@ -751,8 +1339,12 @@ mod tests {
         assert!(pipeline
             .by_name("playback_producer_intervideosink")
             .is_some());
+        // Per-consumer audio sinks.
         assert!(pipeline
-            .by_name("playback_producer_interaudiosink")
+            .by_name("playback_producer_audio_rec_sink")
+            .is_some());
+        assert!(pipeline
+            .by_name("playback_producer_audio_stream_sink")
             .is_some());
     }
 
@@ -854,8 +1446,16 @@ mod tests {
         // machine is the source of truth - both pipelines are not
         // allowed to be Playing simultaneously.
         init_gst();
-        let live = build_live_producer_pipeline(640, 480, 30, false, None)
-            .expect("live producer should build");
+        let live = build_live_producer_pipeline(
+            640,
+            480,
+            30,
+            false,
+            None,
+            CameraBackend::Libcamera,
+            Orientation::Identity,
+        )
+        .expect("live producer should build");
 
         let c = ProducerController::new();
         c.install_live(live);
@@ -878,8 +1478,16 @@ mod tests {
     #[test]
     fn controller_stop_playback_falls_back_to_live() {
         init_gst();
-        let live = build_live_producer_pipeline(640, 480, 30, false, None)
-            .expect("live producer should build");
+        let live = build_live_producer_pipeline(
+            640,
+            480,
+            30,
+            false,
+            None,
+            CameraBackend::Libcamera,
+            Orientation::Identity,
+        )
+        .expect("live producer should build");
 
         let c = ProducerController::new();
         c.install_live(live);
@@ -902,8 +1510,16 @@ mod tests {
         // The error must propagate as `Err` rather than panicking, and
         // the controller's active state must NOT advance to "playback".
         init_gst();
-        let live = build_live_producer_pipeline(640, 480, 30, false, None)
-            .expect("live producer should build");
+        let live = build_live_producer_pipeline(
+            640,
+            480,
+            30,
+            false,
+            None,
+            CameraBackend::Libcamera,
+            Orientation::Identity,
+        )
+        .expect("live producer should build");
         let c = ProducerController::new();
         c.install_live(live);
         c.start_live().expect("start_live");

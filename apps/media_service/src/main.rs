@@ -90,10 +90,54 @@ pub struct MediaConfig {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    /// Horizontally mirror frames at the producer (before
+    /// `intervideosink`), so every consumer - recording, streaming,
+    /// frame_export - gets the corrected image without per-consumer
+    /// plumbing. Operator-set when the physical camera mount inverts
+    /// left/right. Default `false` adds zero pipeline cost (no extra
+    /// element); `true` inserts a `videoflip method=horizontal-flip`
+    /// on the Libcamera / V4l2 path (CPU) or sets `flip-method=4`
+    /// on the existing `nvvidconv` on Nvargus (Tegra VIC).
+    #[serde(default)]
+    pub flip_horizontal: bool,
+    /// Rotate the producer frames 180° (top↔bottom +
+    /// left↔right) - operator-set when the camera is physically
+    /// mounted upside down. Composes with `flip_horizontal`: the
+    /// four (rotate_180, flip_horizontal) combinations each map
+    /// to a single videoflip / nvvidconv enum value (no extra
+    /// element inserted). On Nvargus the work folds into the
+    /// existing `live_producer_video_nvvidconv` via `flip-method`;
+    /// on the Libcamera / V4l2 / dev-container paths the single
+    /// `videoflip` element's `method` is chosen accordingly.
+    #[serde(default)]
+    pub rotate_180: bool,
     #[serde(default = "default_recording_dir")]
     pub recording_dir: String,
+    /// H.264 quantization parameter for the Jetson
+    /// recording encoder (`nvv4l2h264enc`) in CQP mode. Ignored
+    /// on the Pi (x264enc CBR path is unaffected). Lower QP =
+    /// higher quality + larger files. See
+    /// `RecordingConfig.encoder_quality_qp` (Pydantic side) for
+    /// the operator-facing tuning guide. Default 30 - slightly
+    /// over Pi's ~8 Mbps for typical content; operator tunes
+    /// up to 35-37 for Pi-parity bandwidth or down to 24-26 for
+    /// archival quality.
+    #[serde(default = "default_encoder_quality_qp")]
+    pub encoder_quality_qp: u32,
     #[serde(default = "default_true")]
     pub audio_enabled: bool,
+    /// Explicit `alsasrc device=...`
+    /// override read from `audio.device` in `config.yaml`. When set,
+    /// the producer uses this string verbatim instead of the
+    /// auto-detected `plughw:{card_id}`. The Jetson Nano's first
+    /// detected card is the Tegra `tegrasndt210ref` virtual ADMAIF
+    /// mixer (no real mic wired); operators point at the USB sound
+    /// card via `audio.device: plughw:CARD=Device`.
+    /// `"default"` (the example-config placeholder) is treated as
+    /// unset so older configs that never overrode this don't
+    /// suddenly resolve to PulseAudio.
+    #[serde(default)]
+    pub audio_device: Option<String>,
     // Audio streaming gate. When false, the per-session
     // stream_bin is built video-only (no flvmux audio request pad), so
     // mediamtx receives a video-only RTMP stream. When true, the bin
@@ -116,6 +160,91 @@ pub struct MediaConfig {
     pub streaming_flow_check_grace_s: u64,
     #[serde(default)]
     pub ai: MediaAiConfig,
+    /// Deployment platform + camera/encoder backends.
+    /// Defaults to the Pi shape so existing configs keep working.
+    #[serde(default)]
+    pub deployment: MediaDeploymentConfig,
+
+    /// Overlay renderer for the streaming consumer's HUD.
+    /// ``"cairo"`` keeps the legacy `cairooverlay` chain (NV12 →
+    /// BGRx → cairo draw → BGRx → I420/NVMM-NV12 → encoder).
+    /// ``"nv12_native"`` swaps in the `aicamnv12overlay` element that
+    /// writes directly into NV12 planes - skipping the colorspace
+    /// round-trip that pegs the streaming thread at 100 % CPU on Pi 5.
+    /// Default is `nv12_native` (validated on Pi 5); Jetson is pinned
+    /// back to `cairo` until streaming is field-validated on that platform.
+    #[serde(default)]
+    pub streaming_overlay_renderer: OverlayRenderer,
+    /// Optional override for the NV12 overlay element's per-element
+    /// sizing (font sizes, scoreboard row height, penalty tile
+    /// dimensions). When `None`, the plugin uses
+    /// `aicam_broadcast_overlay::layout::LayoutSizes::default()`.
+    /// Populated from `video.streaming.overlay_layout` in
+    /// `config.yaml`; pushed to the plugin once at streaming start
+    /// via the `layout-sizes-json` GObject property.
+    #[serde(default)]
+    pub streaming_overlay_layout: Option<aicam_broadcast_overlay::layout::LayoutSizes>,
+}
+
+/// Streaming HUD renderer choice. See
+/// `MediaConfig::streaming_overlay_renderer`.
+///
+/// Default `Nv12Native` (validated on Pi 5); Jetson is pinned back to
+/// `Cairo` until streaming is field-validated on that platform.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OverlayRenderer {
+    /// Legacy `cairooverlay` + two `videoconvert` chain. Still the
+    /// Jetson default until field-validation on that platform.
+    #[serde(rename = "cairo")]
+    Cairo,
+    /// `aicamnv12overlay` (NV12-native) - no `videoconvert` bracket,
+    /// encoder consumes NV12 directly. Default on Pi.
+    #[serde(rename = "nv12_native")]
+    #[default]
+    Nv12Native,
+}
+
+/// Hardware-platform selection mirrored from the Python
+/// schema (``apps/control_api/app/models.py::DeploymentConfig``). The
+/// media service reads ``config.yaml`` directly with ``serde_yaml`` -
+/// it does not consume the Python schema - so the fields are
+/// declared here too. Defaults match the Pi behaviour byte-for-byte
+/// so configs without a ``deployment`` block keep working unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaDeploymentConfig {
+    /// ``"pi"`` or ``"jetson"``. On ``"jetson"`` ``load_config`` also
+    /// force-nulls every AI model selection as belt-and-suspenders
+    /// against a Pi config being copied verbatim to a Jetson host.
+    #[serde(default = "default_platform")]
+    pub platform: String,
+    /// GStreamer camera source: ``libcamera`` / ``nvargus`` / ``v4l2``.
+    #[serde(default = "default_camera_backend")]
+    pub camera_backend: String,
+    /// H.264 encoder: ``x264`` / ``nvv4l2_h264``.
+    #[serde(default = "default_video_encoder")]
+    pub video_encoder: String,
+}
+
+impl Default for MediaDeploymentConfig {
+    fn default() -> Self {
+        Self {
+            platform: default_platform(),
+            camera_backend: default_camera_backend(),
+            video_encoder: default_video_encoder(),
+        }
+    }
+}
+
+fn default_platform() -> String {
+    "pi".to_string()
+}
+
+fn default_camera_backend() -> String {
+    "libcamera".to_string()
+}
+
+fn default_video_encoder() -> String {
+    "x264".to_string()
 }
 
 /// Per-scope model selection, resolved against the registry at load time.
@@ -215,6 +344,12 @@ fn load_config() -> MediaConfig {
         if let Some(f) = video.get("fps").and_then(|v| v.as_u64()) {
             cfg.fps = f as u32;
         }
+        if let Some(fh) = video.get("flip_horizontal").and_then(|v| v.as_bool()) {
+            cfg.flip_horizontal = fh;
+        }
+        if let Some(r180) = video.get("rotate_180").and_then(|v| v.as_bool()) {
+            cfg.rotate_180 = r180;
+        }
     }
     if let Some(rec) = yaml.get("video").and_then(|v| v.get("recording")) {
         if let Some(dir) = rec.get("directory").and_then(|v| v.as_str()) {
@@ -222,6 +357,36 @@ fn load_config() -> MediaConfig {
         }
         if let Some(ae) = rec.get("audio_enabled").and_then(|v| v.as_bool()) {
             cfg.audio_enabled = ae;
+        }
+        // Per-deploy Jetson recording QP override. Clamp
+        // to the H.264 spec range [0, 51] - out-of-range values
+        // silently fall back to the default so a config typo
+        // can't break recording.
+        if let Some(qp) = rec.get("encoder_quality_qp").and_then(|v| v.as_u64()) {
+            if (0..=51).contains(&qp) {
+                cfg.encoder_quality_qp = qp as u32;
+            } else {
+                warn!(
+                    value = qp,
+                    "video.recording.encoder_quality_qp out of range [0..51], using default {}",
+                    default_encoder_quality_qp()
+                );
+            }
+        }
+    }
+    // Explicit ALSA device string from
+    // `audio.device`. Used in preference to the auto-detected
+    // `plughw:{card_id}` when set. "default" - the example-config
+    // placeholder - is treated as unset so older configs that never
+    // overrode this don't suddenly pick the ALSA "default" PCM
+    // (which on Jetson resolves to PulseAudio).
+    if let Some(dev) = yaml
+        .get("audio")
+        .and_then(|v| v.get("device"))
+        .and_then(|v| v.as_str())
+    {
+        if !dev.is_empty() && dev != "default" {
+            cfg.audio_device = Some(dev.to_string());
         }
     }
     // streaming flow-check grace period.
@@ -244,6 +409,49 @@ fn load_config() -> MediaConfig {
     {
         cfg.streaming_audio_enabled = en;
     }
+    // Pipeline-integration switch for the NV12-native
+    // overlay. Default is "nv12_native"; a config without this key
+    // gets the new default via `OverlayRenderer::default()`.
+    if let Some(s) = yaml
+        .get("video")
+        .and_then(|v| v.get("streaming"))
+        .and_then(|s| s.get("overlay_renderer"))
+        .and_then(|v| v.as_str())
+    {
+        cfg.streaming_overlay_renderer = match s {
+            "cairo" => OverlayRenderer::Cairo,
+            "nv12_native" => OverlayRenderer::Nv12Native,
+            other => {
+                warn!(
+                    value = other,
+                    "video.streaming.overlay_renderer: unknown value, defaulting to nv12_native"
+                );
+                OverlayRenderer::Nv12Native
+            }
+        };
+    }
+    // Optional overlay sizing override (only used by the
+    // NV12-native renderer; cairo path ignores this).
+    if let Some(layout_yaml) = yaml
+        .get("video")
+        .and_then(|v| v.get("streaming"))
+        .and_then(|s| s.get("overlay_layout"))
+    {
+        match serde_json::from_value::<aicam_broadcast_overlay::layout::LayoutSizes>(
+            layout_yaml.clone(),
+        ) {
+            Ok(sizes) => {
+                cfg.streaming_overlay_layout = Some(sizes);
+                info!(?sizes, "video.streaming.overlay_layout applied");
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "video.streaming.overlay_layout malformed; using defaults"
+                );
+            }
+        }
+    }
 
     // ---- AI model selection (unified registry) ------------------
     let ai = yaml.get("ai");
@@ -253,8 +461,34 @@ fn load_config() -> MediaConfig {
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // ---- deployment.platform / camera_backend / video_encoder ----
+    if let Some(dep) = yaml.get("deployment") {
+        if let Some(p) = dep.get("platform").and_then(|v| v.as_str()) {
+            cfg.deployment.platform = p.to_string();
+        }
+        if let Some(c) = dep.get("camera_backend").and_then(|v| v.as_str()) {
+            cfg.deployment.camera_backend = c.to_string();
+        }
+        if let Some(e) = dep.get("video_encoder").and_then(|v| v.as_str()) {
+            cfg.deployment.video_encoder = e.to_string();
+        }
+    }
+
+    // Belt-and-suspenders against a Pi config being copied
+    // verbatim to a Jetson host. The Python `normalize_for_platform`
+    // does the same on the control_api side; this guard means the
+    // media service still degrades gracefully even if a stale
+    // config.yaml carries an AI model selection that would otherwise
+    // try to build a Hailo pipeline on a box without a Hailo device.
+    if cfg.deployment.platform == "jetson" {
+        cfg.ai.object_detection_model = None;
+    }
+
     info!(
         path = %config_path.display(),
+        platform = %cfg.deployment.platform,
+        camera_backend = %cfg.deployment.camera_backend,
+        video_encoder = %cfg.deployment.video_encoder,
         object_detection_model = ?cfg.ai.object_detection_model,
         "Loaded config from file"
     );
@@ -339,6 +573,14 @@ fn default_streaming_flow_check_grace_s() -> u64 {
     10
 }
 
+/// Default H.264 QP for the Jetson recording encoder.
+/// QP=30 produces 30-60 Mbps on detail-heavy room content; for a
+/// uniform RoboCup field surface it will be much lower. Operator
+/// tunes via `video.recording.encoder_quality_qp` in `config.yaml`.
+fn default_encoder_quality_qp() -> u32 {
+    30
+}
+
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
@@ -346,11 +588,24 @@ impl Default for MediaConfig {
             height: 1080,
             fps: 30,
             bitrate_kbps: 8192,
+            flip_horizontal: false,
+            rotate_180: false,
             recording_dir: default_recording_dir(),
+            encoder_quality_qp: default_encoder_quality_qp(),
             audio_enabled: true,
-            streaming_audio_enabled: false,
+            audio_device: None,
+            // Stream the live microphone by default - broadcasters
+            // overwhelmingly want audio in their RTMP feed. Operators
+            // who specifically want silent video can set
+            // `video.streaming.audio_enabled: false` in `config.yaml`;
+            // the consumer's silent-audio fallback still keeps the FLV
+            // header valid so YouTube/mediamtx accept it.
+            streaming_audio_enabled: true,
             streaming_flow_check_grace_s: default_streaming_flow_check_grace_s(),
             ai: MediaAiConfig::default(),
+            deployment: MediaDeploymentConfig::default(),
+            streaming_overlay_renderer: OverlayRenderer::default(),
+            streaming_overlay_layout: None,
         }
     }
 }
@@ -373,6 +628,15 @@ impl MediaConfig {
 pub struct StreamingSession {
     pub pipeline: gst::Pipeline,
     pub buffer_count: Arc<AtomicU64>,
+    /// When the streaming consumer was built with
+    /// `overlay_renderer = nv12_native`, this holds the live
+    /// `aicamnv12overlay` element so the per-session publisher loop
+    /// in `start_streaming` can set `scoreboard-state-json` on it at
+    /// 10 Hz. `None` on the legacy cairo path.
+    pub nv12_overlay_element: Option<gst::Element>,
+    /// Stop signal for the NV12-overlay state-publisher task. Flipped
+    /// to `true` at stream teardown so the publisher exits cleanly.
+    pub nv12_overlay_publisher_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Persistent recording consumer pipelines held in `AppState`. Both
@@ -653,6 +917,21 @@ async fn main() -> anyhow::Result<()> {
         replay_state: Arc::new(RwLock::new(ReplayState::default())),
     };
 
+    // Wire the GameController ZMQ subscriber that feeds the
+    // cairo overlay's GameOverlayState. The producer for these
+    // messages is the apps.telemetry_service.gamecontroller listener;
+    // the consumer is this subscriber, which resolves team numbers to
+    // names via config/teams.json.
+    let teams_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("config/teams.json");
+    let teams_map = overlay::load_teams_map(teams_path.to_str().unwrap_or("config/teams.json"));
+    overlay::start_overlay_subscriber(
+        state.overlay_state.clone(),
+        "tcp://127.0.0.1:5560", // XPUB broker port (matches apps/bus/broker.py)
+        teams_map,
+    );
+
     let app = build_router(state.clone());
 
     // Auto-start the pipeline so frames are available immediately
@@ -783,6 +1062,10 @@ async fn teardown_pipelines(state: &AppState) {
         }
         let mut s = state.status.write().await;
         s.recording_active = false;
+        // Clear the server-side anchor
+        // so the UI doesn't paint a stale elapsed counter the next
+        // time someone navigates to the Recording page.
+        s.recording_started_at = None;
     }
     if let Some(ai) = state.ai_pipeline.write().await.take() {
         if let Err(e) = pipeline::stop_pipeline(&ai) {
@@ -823,19 +1106,37 @@ async fn ensure_live_producer(state: &AppState) -> bool {
 
     let cfg = state.config.read().await.clone();
     let s = state.status.read().await;
-    let audio_enabled = s.audio_available;
-    let audio_device = s.audio_device.clone();
+    // Honour `video.recording.audio_enabled`
+    // from config. Pre-fix the producer always enabled the audio chain
+    // when a device existed, ignoring the config. That broke on Jetson
+    // where PulseAudio autospawns and holds plughw:1 - the alsasrc
+    // element failed to open the device and the whole live producer
+    // pipeline never reached PLAYING.
+    //
+    // Audio is on iff the config wants it AND either an explicit
+    // device override exists in config OR auto-detection found one.
+    // The explicit `cfg.audio_device` value wins over auto-detection
+    // because the Jetson's first detected card (`tegrasndt210ref`)
+    // is a virtual ADMAIF mixer with no real mic; the operator
+    // points at the USB sound card via
+    // `audio.device: plughw:CARD=Device` in config.yaml.
+    let audio_device = cfg.audio_device.clone().or_else(|| s.audio_device.clone());
+    let audio_enabled = cfg.audio_enabled && audio_device.is_some();
     drop(s);
 
     let ai_config = resolve_ai_config(&cfg.ai);
     let hailo_available = state.status.read().await.hailo_available;
 
+    let camera_backend = crate::producer::CameraBackend::parse(&cfg.deployment.camera_backend);
     match pipeline::build_live_producer(
         cfg.width,
         cfg.height,
         cfg.fps,
         audio_enabled,
         audio_device.as_deref(),
+        camera_backend,
+        cfg.flip_horizontal,
+        cfg.rotate_180,
         &ai_config,
         hailo_available,
     ) {
@@ -956,6 +1257,8 @@ async fn ensure_live_producer(state: &AppState) -> bool {
             let recording_pipelines_built = match consumers::build_recording_video_consumer_pipeline(
                 cfg.fps,
                 cfg.scaled_bitrate(),
+                consumers::VideoEncoder::parse(&cfg.deployment.video_encoder),
+                cfg.encoder_quality_qp,
             ) {
                 Ok(v) => {
                     // Use the producer's actual audio-availability
@@ -1357,10 +1660,14 @@ async fn start_streaming(
     // rtmpsink bug by construction.
     let consumer = match consumers::build_streaming_consumer_pipeline(
         &request.rtmp_url,
+        cfg.width,
+        cfg.height,
         stream_bitrate_kbps,
         cfg.fps,
         has_audio,
         state.overlay_state.clone(),
+        consumers::VideoEncoder::parse(&cfg.deployment.video_encoder),
+        cfg.streaming_overlay_renderer,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -1396,9 +1703,13 @@ async fn start_streaming(
     }
 
     let counter = consumer.buffer_count.clone();
+    let nv12_overlay_element = consumer.nv12_overlay_element.clone();
+    let nv12_overlay_publisher_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     *state.streaming_pipeline.write().await = Some(StreamingSession {
         pipeline: consumer.pipeline,
         buffer_count: consumer.buffer_count,
+        nv12_overlay_element: nv12_overlay_element.clone(),
+        nv12_overlay_publisher_done: nv12_overlay_publisher_done.clone(),
     });
 
     {
@@ -1407,6 +1718,57 @@ async fn start_streaming(
         s.streaming_error = None;
     }
     info!(rtmp_url = %request.rtmp_url, "Streaming started (per-session consumer pipeline)");
+
+    // When the streaming consumer built an
+    // `aicamnv12overlay` element, push the current scoreboard state
+    // to it via the GObject `scoreboard-state-json` property at 10 Hz.
+    // We deliberately do NOT cross the cdylib / main-binary boundary
+    // with the Rust `Nv12Overlay` type - that would re-register
+    // `AicamNv12Overlay` in glib's subclass table and panic, because
+    // the .so already registered it at plugin load. JSON is cheap at
+    // 10 Hz / ~1 KB and keeps the IPC entirely at the well-defined
+    // GObject property layer.
+    if let Some(elem) = nv12_overlay_element {
+        // Push the layout sizes once at start (sizes change only on
+        // service restart / config reload - no 10 Hz update needed).
+        if let Some(ref sizes) = cfg.streaming_overlay_layout {
+            if let Ok(s) = serde_json::to_string(sizes) {
+                elem.set_property("layout-sizes-json", &s);
+            }
+        }
+
+        // Seed once before the timer kicks in so the first frame
+        // after PLAYING already shows the live state.
+        let seed_json = serde_json::to_string(&overlay::scoreboard_state_from_game(
+            &state.overlay_state.read().expect("overlay_state poisoned"),
+        ))
+        .unwrap_or_default();
+        elem.set_property("scoreboard-state-json", &seed_json);
+
+        let overlay_state_handle = state.overlay_state.clone();
+        let done = nv12_overlay_publisher_done.clone();
+        let elem_for_task = elem.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tick.tick().await;
+                if done.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let json = match overlay_state_handle.read() {
+                    Ok(g) => {
+                        match serde_json::to_string(&overlay::scoreboard_state_from_game(&g)) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        }
+                    }
+                    Err(_) => continue,
+                };
+                elem_for_task.set_property("scoreboard-state-json", &json);
+            }
+        });
+        info!("streaming consumer: NV12 overlay state publisher started (10 Hz, JSON property)");
+    }
 
     spawn_streaming_flow_check(state.clone(), counter);
 
@@ -1421,6 +1783,12 @@ async fn start_streaming(
 
 async fn stop_streaming(State(state): State<AppState>) -> impl IntoResponse {
     if let Some(session) = state.streaming_pipeline.write().await.take() {
+        // Signal the NV12 publisher loop to exit before the
+        // pipeline transitions to NULL so the publisher doesn't race
+        // a deallocated element.
+        session
+            .nv12_overlay_publisher_done
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = session.pipeline.set_state(gst::State::Null) {
             warn!(error = ?e, "Error tearing down streaming consumer pipeline");
         } else {
@@ -1852,10 +2220,24 @@ fn spawn_streaming_abr_loop(state: AppState, ceiling_kbps: u32) {
             }
             let ratio = (level_ns as f64) / (max_ns as f64);
             if let Some(new_kbps) = controller.tick(ratio) {
-                encoder.set_property("bitrate", new_kbps);
+                // x264enc takes bitrate in kbps;
+                // nvv4l2h264enc takes bps. Detect the encoder
+                // factory and scale accordingly so a Jetson
+                // session gets sane bitrate updates.
+                let factory_name = encoder
+                    .factory()
+                    .map(|f| f.name().to_string())
+                    .unwrap_or_default();
+                let wire_value: u32 = if factory_name == "nvv4l2h264enc" {
+                    new_kbps.saturating_mul(1000)
+                } else {
+                    new_kbps
+                };
+                encoder.set_property("bitrate", wire_value);
                 info!(
                     queue_level_ratio = format_args!("{ratio:.2}"),
                     new_bitrate_kbps = new_kbps,
+                    encoder = %factory_name,
                     "ABR: bitrate adjusted"
                 );
             }
@@ -1910,13 +2292,49 @@ fn spawn_recording_flow_check(state: AppState, counter: Arc<AtomicU64>) {
 #[cfg(test)]
 fn spawn_recording_flow_check(_state: AppState, _counter: Arc<AtomicU64>) {}
 
+/// Outcome of classifying a live-producer bus error.
+///
+/// Pulled out of `handle_bus_error` so the decision is testable
+/// without spawning the tokio bus-watch consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusErrorAction {
+    /// Process must exit non-zero so systemd's `Restart=on-failure`
+    /// rebuilds it. Used for any error from a core producer element
+    /// (libcamerasrc / alsasrc / intervideosink / interaudiosink) -
+    /// the producer pipeline can't recover in-process, and staying
+    /// alive with a dead source zombies the service until manual
+    /// `systemctl restart` (e.g. after a USB audio unplug).
+    Exit,
+}
+
+/// Classify a GStreamer bus error on the live producer's bus.
+///
+/// Today every producer-pipeline error is treated as `Exit`. The
+/// per-consumer bus watches (`install_consumer_bus_watch`,
+/// `install_streaming_bus_watch`, `install_playback_eos_watch`)
+/// already classify and contain their own per-session errors; the
+/// only messages that reach this classifier are core producer
+/// failures, all of which are unrecoverable in-process. Kept as a
+/// function (rather than inlined into `handle_bus_error`) so a
+/// future per-element exception (e.g. "transient libcamera frame
+/// drop is not fatal") can be added without touching the tokio
+/// task wiring.
+pub fn classify_producer_bus_error(_src: &str, _reason: &str) -> BusErrorAction {
+    BusErrorAction::Exit
+}
+
 /// Classify a GStreamer bus error from the **live producer
 /// pipeline**. Every consumer has its own bus watch
 /// (`install_consumer_bus_watch`, `install_streaming_bus_watch`,
 /// `install_playback_eos_watch`), so the only errors that reach this
 /// classifier are core errors on the live producer itself
 /// (`libcamerasrc`, `alsasrc`, `intervideosink`, `interaudiosink`).
-/// Treat them all as fatal: set `state=Error`.
+/// Act on the classifier - set `state=Error` for the
+/// status snapshot, then exit non-zero so systemd's
+/// `Restart=on-failure` (+ `RestartSec=5`) rebuilds the service.
+/// Previously this only logged "(fatal)" and stayed alive, which
+/// turned a USB mic unplug into a zombie service that needed
+/// manual `systemctl restart` to recover.
 #[cfg(not(test))]
 async fn handle_bus_error(state: &AppState, src: &str, reason: &str, debug_info: &str) {
     error!(
@@ -1925,8 +2343,41 @@ async fn handle_bus_error(state: &AppState, src: &str, reason: &str, debug_info:
         debug_info = %debug_info,
         "live producer bus error (fatal - no per-pipeline classifier covers this)"
     );
-    let mut s = state.status.write().await;
-    s.state = MediaState::Error;
+    {
+        let mut s = state.status.write().await;
+        s.state = MediaState::Error;
+    }
+
+    match classify_producer_bus_error(src, reason) {
+        BusErrorAction::Exit => {
+            // Best-effort: transition the producer pipeline to NULL
+            // before exiting so GStreamer releases the camera /
+            // ALSA handles. The systemd unit's
+            // `ExecStopPost=/bin/sleep 2` plus `RestartSec=5` give
+            // the kernel plenty of time to free /dev/video0 and the
+            // Hailo vdevice if the NULL transition is slow or
+            // racey, but doing it explicitly here keeps the common
+            // path clean.
+            if let Some(lp) = state.live_producer.write().await.as_ref() {
+                if let Err(e) = lp.pipeline.set_state(gstreamer::State::Null) {
+                    warn!(error = ?e, "live producer set_state(Null) failed during fatal-exit cleanup");
+                }
+            }
+            error!(
+                element = %src,
+                "exiting with code 1 so systemd Restart=on-failure rebuilds the service. \
+                 Manual `systemctl restart` no longer required to recover \
+                 from USB audio unplug / camera disconnect."
+            );
+            // Flush stdout/stderr so the exit log line reaches the
+            // journal before we tear down. tracing's json layer
+            // writes to stdout - a single flush is enough.
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,6 +2808,31 @@ mod tests {
         let body = json_body(resp).await;
         assert_eq!(body["state"], "idle");
         assert_eq!(body["recording_active"], false);
+    }
+
+    /// Any error reaching the producer bus classifier
+    /// must be treated as `Exit`. The per-consumer bus watches
+    /// already contain per-session errors, so anything that makes
+    /// it to this layer is a core producer failure (libcamerasrc,
+    /// alsasrc, intervideosink, interaudiosink) and the process
+    /// can't recover in-place.
+    #[test]
+    fn classify_producer_bus_error_treats_all_as_exit() {
+        for (src, reason) in [
+            (
+                "live_producer_audio_src",
+                "Error recording from audio device. The device has been disconnected.",
+            ),
+            ("live_producer_video_src", "Internal data stream error."),
+            ("live_producer_intervideosink", "Output window was closed"),
+            ("", ""),
+        ] {
+            assert_eq!(
+                classify_producer_bus_error(src, reason),
+                BusErrorAction::Exit,
+                "{src:?} ({reason:?}) must classify as Exit"
+            );
+        }
     }
 
     #[tokio::test]

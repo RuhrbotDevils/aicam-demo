@@ -38,7 +38,12 @@ const DetectionPage = {
         </div>
       </div>
     `;
-    Magnifier.attach(document.getElementById('object-detection-preview-box'));
+    // Guard against the magnifier widget not being loaded and against
+    // the tile being absent.
+    if (typeof Magnifier !== 'undefined') {
+      const tile = document.getElementById('object-detection-preview-box');
+      if (tile) Magnifier.attach(tile);
+    }
     this._refreshStatus();
     this._statusInterval = setInterval(() => this._refreshStatus(), 5000);
   },
@@ -93,6 +98,10 @@ const DetectionPage = {
    * on demand by `POST /api/v1/detection/cpu_snap`. Live polling does
    * not make sense (each Snap costs seconds of inference), so the
    * Live checkbox is hidden and any active Live polling is stopped.
+   *
+   * The cpu_detector systemd service is not auto-started - Snap on
+   * the Detection page is the only way to trigger CPU inference, and
+   * the control_api runs the inference inline.
    */
   async setPreviewBackend(backend) {
     try {
@@ -126,6 +135,11 @@ const DetectionPage = {
 
   /**
    * Render one model status card.
+   *
+   * `backend` is `'hailo'` or `'cpu'`; `previewBackend` is the
+   * backend currently selected for Snap / Live (drives the radio
+   * checked state). The radio writes features.cpu_detection via
+   * `setPreviewBackend`.
    */
   _modelCard(title, model, isActive, backend, previewBackend) {
     const radio = backend && previewBackend !== undefined
@@ -185,14 +199,16 @@ const DetectionPage = {
     if (btn) { btn.disabled = true; btn.classList.add('btn-busy'); }
     try {
       // CPU mode: trigger one inference inline before refreshing the
-      // preview. The endpoint loads the model on first call (~3-5 s) and
-      // runs inference (~1-3 s) per call thereafter; 
-      // notification on configuration errors (no model selected)
+      // preview. The endpoint loads YOLO on first call (~3-5 s) and
+      // runs inference (~1-3 s) per call thereafter; we surface a
+      // notification on configuration errors (no model selected) so
+      // the user knows to configure a CPU model first.
       if (this._previewBackend === 'cpu') {
         try {
           await API.post('/detection/cpu_snap');
         } catch (e) {
-          // The API helper already shows a Notify.error.
+          // The API helper already shows a Notify.error for non-2xx;
+          // bail out so we don't render a stale frame.
           return;
         }
       }

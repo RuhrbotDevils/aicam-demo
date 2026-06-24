@@ -4,123 +4,171 @@
 /**
  * Preview-tile magnifier widget.
  *
- * Usage:
- *   Magnifier.attach(containerEl, { lensSize: 240 });
+ * Magnifier.attach(container, options) binds mouse + touch handlers
+ * to a preview container so the operator can press-and-drag to see
+ * the region under the cursor at 1:1 native pixel resolution. The
+ * container's <img> element is mirrored into a popup positioned at
+ * the cursor; the popup hides on mouse-up / touch-end.
  *
- * Behaviour:
- *   - Hover: cursor changes to a zoom-in glyph.
- *   - mousedown / touchstart: a small popup appears next to the
- *     pointer, showing the region under the pointer at the
- *     underlying <img>'s native resolution.
- *   - mousemove / touchmove (while pressed): popup tracks the pointer.
- *   - mouseup / touchend / touchcancel: popup hides.
- *
- * Live preview support: the inner image's `src` is refreshed on
- * each move, so when the underlying preview JPEG rotates the lens
- * picks up the new content automatically.
+ * Reusable across the Dashboard, Object Detection, and Recording
+ * preview tiles. The widget is idempotent - a second attach() on
+ * the same container is a no-op.
  */
 const Magnifier = {
   /**
-   * @param {HTMLElement} container - the preview tile (must contain an <img>).
-   * @param {object} [options]
-   * @param {number} [options.lensSize=240] - popup edge length, px.
+   * Attach the magnifier to *container*. The container must hold (or
+   * eventually hold - the widget tolerates an empty container at
+   * attach time) an <img> child whose `naturalWidth` /
+   * `naturalHeight` reflect the camera's native resolution. Live
+   * previews replace the <img> src as new frames arrive; the popup
+   * mirrors the latest src on every move event so the magnified
+   * view animates with the underlying preview.
+   *
+   * @param {HTMLElement} container - the preview-container element.
+   * @param {{lensSize?: number}} [options] - lensSize defaults to 240 px.
    */
-  attach(container, options) {
+  attach(container, options = {}) {
     if (!container || container._magnifierAttached) return;
     container._magnifierAttached = true;
 
-    const lensSize = (options && options.lensSize) || 240;
-    container.classList.add("magnifier-target");
+    const lensSize = options.lensSize || 240;
+    container.classList.add('magnifier-target');
 
+    // Single popup per attach. Created lazily on first show so we
+    // don't pay for a hidden DOM node on pages that never magnify.
     let popup = null;
+    let popupImg = null;
 
-    const positionPopup = (clientX, clientY) => {
-      const img = container.querySelector("img");
-      if (!img || !img.naturalWidth) return;
+    const ensurePopup = () => {
+      if (popup) return;
+      popup = document.createElement('div');
+      popup.className = 'magnifier-popup';
+      popup.style.width = `${lensSize}px`;
+      popup.style.height = `${lensSize}px`;
+      popupImg = document.createElement('img');
+      popupImg.className = 'magnifier-popup-img';
+      popup.appendChild(popupImg);
+      document.body.appendChild(popup);
+    };
 
-      if (!popup) {
-        popup = document.createElement("div");
-        popup.className = "magnifier-popup";
-        popup.style.width = `${lensSize}px`;
-        popup.style.height = `${lensSize}px`;
-        const inner = document.createElement("img");
-        inner.alt = "";
-        inner.draggable = false;
-        popup.appendChild(inner);
-        document.body.appendChild(popup);
+    const showAt = (clientX, clientY) => {
+      const img = container.querySelector('img');
+      if (!img || !img.src || !img.complete) return;
+      const rect = img.getBoundingClientRect();
+      // Reject events that aren't actually over the visible image.
+      if (
+        clientX < rect.left ||
+        clientX > rect.right ||
+        clientY < rect.top ||
+        clientY > rect.bottom
+      ) {
+        hide();
+        return;
       }
 
-      const rect = img.getBoundingClientRect();
-      // Normalised pointer position inside the displayed <img>, 0..1.
-      const px = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-      const py = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+      ensurePopup();
 
-      // Quadrant-based positioning: place the lens opposite the cursor's
-      // half of the image so it does not cover the area being inspected.
-      // Left half → lens on the right; right half → lens on the left.
-      // Top half → lens below; bottom half → lens above.
-      const offset = 24;
+      // Map the cursor's display-space position onto the source
+      // image's native pixel coordinates. naturalWidth / Height come
+      // from the loaded image; rect.width / height are the rendered
+      // size.
+      const natW = img.naturalWidth || rect.width;
+      const natH = img.naturalHeight || rect.height;
+      const sx = ((clientX - rect.left) / rect.width) * natW;
+      const sy = ((clientY - rect.top) / rect.height) * natH;
+
+      // Mirror the latest src so live previews animate inside the
+      // popup. Skip the assignment when src hasn't changed to avoid
+      // re-decoding the same frame on every mousemove tick.
+      if (popupImg.src !== img.src) {
+        popupImg.src = img.src;
+      }
+      // Render at 1:1 native pixels - lock width/height to the
+      // image's natural size and offset so the cursor pixel sits at
+      // the lens centre.
+      popupImg.style.width = `${natW}px`;
+      popupImg.style.height = `${natH}px`;
+      popupImg.style.left = `${-sx + lensSize / 2}px`;
+      popupImg.style.top = `${-sy + lensSize / 2}px`;
+
+      // Position the popup *opposite* the cursor's
+      // quadrant within the image, so it never covers the area the
+      // operator is trying to inspect.
+      //
+      //   cursor on left half  -> popup right of cursor
+      //   cursor on right half -> popup left of cursor
+      //   cursor on top half   -> popup below cursor
+      //   cursor on bottom half -> popup above cursor
+      //
+      // px / py are the cursor's normalised position inside the
+      // image rect (0..1).
+      const margin = 24;
+      const px = (clientX - rect.left) / rect.width;
+      const py = (clientY - rect.top) / rect.height;
       const onLeftHalf = px < 0.5;
       const onTopHalf = py < 0.5;
-      const rawLeft = onLeftHalf ? clientX + offset : clientX - lensSize - offset;
-      const rawTop = onTopHalf ? clientY + offset : clientY - lensSize - offset;
-      // Clamp to the viewport so the lens never falls off-screen, e.g.
-      // when the preview tile sits very near a window edge.
-      const left = Math.max(8, Math.min(window.innerWidth - lensSize - 8, rawLeft));
-      const top = Math.max(8, Math.min(window.innerHeight - lensSize - 8, rawTop));
-      popup.style.left = `${left}px`;
-      popup.style.top = `${top}px`;
-
-      const inner = popup.firstChild;
-      // Refresh src in case the live preview just rotated.
-      if (inner.src !== img.src) inner.src = img.src;
-      // Native pixel size - the inner img is positioned so the cursor's
-      // pixel sits at the centre of the lens.
-      inner.style.width = `${img.naturalWidth}px`;
-      inner.style.height = `${img.naturalHeight}px`;
-      inner.style.left = `${lensSize / 2 - px * img.naturalWidth}px`;
-      inner.style.top = `${lensSize / 2 - py * img.naturalHeight}px`;
+      let left = onLeftHalf ? clientX + margin : clientX - lensSize - margin;
+      let top = onTopHalf ? clientY + margin : clientY - lensSize - margin;
+      // Viewport clamp as the safety net - never let the lens fall
+      // off-screen at extreme aspect ratios.
+      if (left + lensSize > window.innerWidth) {
+        left = window.innerWidth - lensSize;
+      }
+      if (top + lensSize > window.innerHeight) {
+        top = window.innerHeight - lensSize;
+      }
+      popup.style.left = `${Math.max(0, left)}px`;
+      popup.style.top = `${Math.max(0, top)}px`;
+      popup.style.display = 'block';
     };
 
     const hide = () => {
       if (popup) {
-        popup.remove();
-        popup = null;
+        popup.style.display = 'none';
       }
     };
 
-    container.addEventListener("mousedown", (e) => {
+    // Mouse: press-and-hold while pointer over the preview.
+    container.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return; // left-button only
+      showAt(e.clientX, e.clientY);
       e.preventDefault();
-      positionPopup(e.clientX, e.clientY);
     });
-    container.addEventListener("mousemove", (e) => {
-      if (popup) positionPopup(e.clientX, e.clientY);
+    container.addEventListener('mousemove', (e) => {
+      if (popup && popup.style.display !== 'none') {
+        showAt(e.clientX, e.clientY);
+      }
     });
-    document.addEventListener("mouseup", hide);
-    container.addEventListener("mouseleave", hide);
+    // mouseup is bound on document so a release anywhere on the page
+    // hides the popup (operator may drag off the tile).
+    document.addEventListener('mouseup', hide);
+    container.addEventListener('mouseleave', hide);
 
+    // Touch: tap-and-hold equivalent. preventDefault on touchmove so
+    // the page doesn't scroll while the operator is dragging the
+    // magnifier across a preview tile.
     container.addEventListener(
-      "touchstart",
+      'touchstart',
       (e) => {
         const t = e.touches[0];
         if (!t) return;
-        positionPopup(t.clientX, t.clientY);
+        showAt(t.clientX, t.clientY);
         e.preventDefault();
       },
       { passive: false },
     );
     container.addEventListener(
-      "touchmove",
+      'touchmove',
       (e) => {
-        if (!popup) return;
+        if (!popup || popup.style.display === 'none') return;
         const t = e.touches[0];
         if (!t) return;
-        positionPopup(t.clientX, t.clientY);
+        showAt(t.clientX, t.clientY);
         e.preventDefault();
       },
       { passive: false },
     );
-    container.addEventListener("touchend", hide);
-    container.addEventListener("touchcancel", hide);
+    container.addEventListener('touchend', hide);
+    container.addEventListener('touchcancel', hide);
   },
 };
