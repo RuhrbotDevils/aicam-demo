@@ -54,11 +54,13 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _start_health_collector()
     _start_detections_collector()
     _start_gc_test_source()
+    _start_gc_live_listener()
     _start_recording_controller()
     _start_game_state_cache_collector()
     yield
     _stop_recording_controller()
     _stop_gc_test_source()
+    _stop_gc_live_listener()
 
 
 app = FastAPI(
@@ -129,6 +131,19 @@ _game_state_cache: dict | None = None
 _penalties_cache: dict | None = None
 _game_state_cache_lock = threading.Lock()
 _game_state_cache_thread: threading.Thread | None = None
+
+# Live GameController UDP listener - the non-test counterpart to the
+# test source. When gc_test_mode is false, bind UDP 3838, parse GC
+# broadcasts, and publish to the bus so the overlay / recording /
+# status pipeline sees a real feed.
+_gc_live_listener: object | None = None
+_gc_live_thread: threading.Thread | None = None
+
+# Monotonic timestamp of the last telemetry packet the app received off
+# the bus (game_state or penalties). Drives the dashboard "GameController"
+# indicator - connected if seen within the window.
+_last_gc_seen: float | None = None
+GC_CONNECTED_WINDOW_S: float = 2.0
 # Stale-detection guard: if no message has arrived for this source
 # within the window, return [] so the preview doesn't draw boxes
 # from a backend that has stopped publishing (e.g. cpu_detector that
@@ -252,6 +267,62 @@ def _stop_gc_test_source() -> None:
     _gc_test_thread = None
 
 
+def _start_gc_live_listener() -> None:
+    """Spawn the live GameController UDP listener.
+
+    The live counterpart to the test source: when ``gc_test_mode`` is
+    false, bind UDP 3838, parse real GameController broadcasts, and
+    publish them to the bus so the overlay, recording controller, and
+    the dashboard GameController indicator all see a live feed. Mutually
+    exclusive with the test source (both publish the same topics).
+    """
+    global _gc_live_listener, _gc_live_thread  # noqa: PLW0603
+    if _gc_live_listener is not None:
+        return
+    try:
+        cfg = config_store.load()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("gc_live_listener: failed to read config (%s)", e)
+        return
+    if getattr(cfg.telemetry, "gc_test_mode", False):
+        return  # the synthetic test source owns the bus instead
+    try:
+        from apps.bus.publisher import Publisher
+        from apps.telemetry_service.gamecontroller import GameControllerListener
+
+        port = getattr(cfg.telemetry, "game_controller_port", 3838)
+        listener = GameControllerListener(publisher=Publisher(), port=port)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("gc_live_listener: failed to construct (%s)", e)
+        return
+
+    def _runner() -> None:
+        try:
+            listener.run()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("gc_live_listener: runner exited (%s)", e)
+
+    t = threading.Thread(target=_runner, name="gc-live-listener", daemon=True)
+    t.start()
+    _gc_live_listener = listener
+    _gc_live_thread = t
+    logger.info("gc_live_listener: started (UDP %s)", port)
+
+
+def _stop_gc_live_listener() -> None:
+    global _gc_live_listener, _gc_live_thread  # noqa: PLW0603
+    if _gc_live_listener is None:
+        return
+    try:
+        _gc_live_listener.stop()  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("gc_live_listener: stop failed (%s)", e)
+    if _gc_live_thread is not None:
+        _gc_live_thread.join(timeout=3)
+    _gc_live_listener = None
+    _gc_live_thread = None
+
+
 def _start_recording_controller() -> None:
     """Wire the GC-driven recording controller.
 
@@ -340,6 +411,11 @@ def _start_game_state_cache_collector() -> None:
             if received is None:
                 continue
             topic, payload = received
+            # Per-packet heartbeat for the GameController indicator.
+            # telemetry.penalties publishes every cycle, so this updates
+            # on every GC packet the app actually ingests.
+            global _last_gc_seen  # noqa: PLW0603
+            _last_gc_seen = time.monotonic()
             try:
                 data = json.loads(payload)
             except (TypeError, ValueError):
@@ -465,6 +541,46 @@ def get_services_health() -> dict:  # type: ignore[type-arg]
     return {"services": _service_health}
 
 
+@app.get("/api/v1/gamecontroller/status", response_model=None)
+def get_gamecontroller_status() -> dict:  # type: ignore[type-arg]
+    """GameController feed liveness for the dashboard.
+
+    `connected` is true when the app ingested a GC packet (game_state
+    or penalties) off the bus within the last GC_CONNECTED_WINDOW_S
+    seconds. `last_seen_age_s` is None until the first packet."""
+    last = _last_gc_seen
+    if last is None:
+        return {"connected": False, "last_seen_age_s": None}
+    age = time.monotonic() - last
+    return {"connected": age < GC_CONNECTED_WINDOW_S, "last_seen_age_s": round(age, 1)}
+
+
+@app.get("/api/v1/wifi/status", response_model=None)
+def get_wifi_status() -> dict:  # type: ignore[type-arg]
+    """Field-wifi link state for the dashboard Services view.
+
+    Reports the selected profile and whether the managed connection is
+    up on the wifi interface. Read-only (nmcli, no root)."""
+    from . import wifi
+
+    fw = config_store.load().network.field_wifi
+    return wifi.query_status(fw.interface, fw.selected_profile)
+
+
+@app.post("/api/v1/wifi/reconnect", response_model=None)
+def post_wifi_reconnect() -> dict:  # type: ignore[type-arg]
+    """Re-run the field-wifi applier (dashboard Reconnect button).
+
+    Fire-and-forget (mirrors the config-PUT hook); the dashboard's
+    status poll reflects the outcome. A no-op when no profile is
+    selected."""
+    selected = config_store.load().network.field_wifi.selected_profile
+    if not selected:
+        return {"status": "no_profile_selected"}
+    _spawn_wifi_apply(reason="manual reconnect via dashboard")
+    return {"status": "reconnecting", "profile": selected}
+
+
 @app.post("/api/v1/system/restart/{service_name}", response_model=None)
 def restart_service(service_name: str):  # type: ignore[no-untyped-def]
     """Restart a systemd service by name."""
@@ -502,18 +618,56 @@ def put_config(config: AppConfig) -> AppConfig:
     # pre-save value because save() may normalise - comparing
     # post-save would always be a no-op.
     prev_allowlist: str | None = None
+    prev_field_name: str | None = None
+    prev_wifi_profile: str | None = None
     try:
-        prev_allowlist = config_store.load().network.firewall.allowed_ip_ranges
+        _prev = config_store.load()
+        prev_allowlist = _prev.network.firewall.allowed_ip_ranges
+        prev_field_name = _prev.video.streaming.field_name
+        prev_wifi_profile = _prev.network.field_wifi.selected_profile
     except Exception:  # noqa: BLE001
         # Initial save before a config.yaml exists, or a config that
         # predates the firewall field. Treat as "always re-apply" so
         # the new field's default takes effect.
         prev_allowlist = None
+        prev_field_name = None
+        prev_wifi_profile = None
     config_store.save(config)
     new_allowlist = config.network.firewall.allowed_ip_ranges
     if prev_allowlist != new_allowlist:
         _spawn_firewall_apply(reason=f"PUT /api/v1/config: {prev_allowlist!r} -> {new_allowlist!r}")
+    # Live-push a changed overlay field name to the media service so the
+    # edit shows on the stream without a restart. The value is already
+    # persisted in config.yaml above; this only mirrors it into the
+    # running overlay state. Best-effort.
+    new_field_name = config.video.streaming.field_name
+    if prev_field_name != new_field_name:
+        _push_overlay_field_name(new_field_name)
+    # Activate the selected field-wifi profile on the Pi when it
+    # changes. The applier (re)configures nmcli and re-applies the
+    # firewall egress lock, so the wifi switch takes effect without a
+    # redeploy. Best-effort, like the firewall hook.
+    new_wifi_profile = config.network.field_wifi.selected_profile
+    if prev_wifi_profile != new_wifi_profile:
+        _spawn_wifi_apply(
+            reason=f"PUT /api/v1/config: wifi {prev_wifi_profile!r} -> {new_wifi_profile!r}"
+        )
     return config
+
+
+def _push_overlay_field_name(field_name: str) -> None:
+    """Best-effort live update of the media service's overlay field
+    label. Persistence lives in config.yaml; this only refreshes the
+    running overlay so the operator need not restart the media service.
+    A failure here is logged, not fatal."""
+    try:
+        httpx.put(
+            f"{media_client._base}/overlay/text",
+            json={"field_name": field_name},
+            timeout=2.0,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not push overlay field_name to media service: %s", e)
 
 
 _FIREWALL_APPLY_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "apply_firewall_rules.py"
@@ -558,6 +712,51 @@ def _spawn_firewall_apply(*, reason: str) -> None:
                 logger.info("firewall apply succeeded")
         except Exception as e:  # noqa: BLE001
             logger.warning("firewall apply errored: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+_WIFI_APPLY_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "apply_wifi_profile.py"
+
+
+def _spawn_wifi_apply(*, reason: str) -> None:
+    """Best-effort fire-and-forget field-wifi (re)activation.
+
+    Runs `apply_wifi_profile.py` under `sudo -n` (the unit's sudoers
+    drop-in grants it); the script drives nmcli to switch the field
+    wifi and re-applies the firewall egress lock. In dev / tests
+    without that grant the apply fails with a logged warning and the
+    operator can re-run the script manually. Longer timeout than the
+    firewall hook because `nmcli connection up` waits for association.
+    """
+
+    def _run() -> None:
+        try:
+            if not _WIFI_APPLY_SCRIPT.exists():
+                logger.warning(
+                    "wifi apply requested (%s) but script %s missing",
+                    reason,
+                    _WIFI_APPLY_SCRIPT,
+                )
+                return
+            logger.info("wifi apply: %s", reason)
+            result = subprocess.run(  # noqa: S603
+                ["sudo", "-n", sys.executable, str(_WIFI_APPLY_SCRIPT)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=45,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "wifi apply failed (rc=%d): stderr=%s",
+                    result.returncode,
+                    result.stderr.strip()[-500:],
+                )
+            else:
+                logger.info("wifi apply succeeded")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("wifi apply errored: %s", e)
 
     threading.Thread(target=_run, daemon=True).start()
 

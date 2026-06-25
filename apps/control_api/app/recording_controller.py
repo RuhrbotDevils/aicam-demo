@@ -1,13 +1,13 @@
 """GC-driven recording controller - auto-starts/stops recordings on game state transitions.
 
 Subscribes to telemetry.game_state on ZMQ and controls recording based on
-GameController state machine.
+the GameController state machine.
 
-Segmentation rule: each recording covers exactly one (team1, team2, match_phase)
-tuple - first half, second half, extra-time first half, extra-time second half,
-or penalty shootout. The controller restarts the recording only when that tuple
-changes. PLAYING → READY → SET → PLAYING within the same half (which happens on
-every goal kickoff in SPL/HSL) does NOT split the recording.
+Trigger rules (automatic mode):
+- START when the state transitions INITIAL -> READY (the match/half kickoff).
+  A goal kickoff (PLAYING -> READY) is NOT from INITIAL, so it never restarts.
+- STOP when the state becomes FINISHED ("Finish" on the GC).
+- ABORT (stop) if no GC packet arrives for GC_TIMEOUT_S (the GC went away).
 
 When recording_mode is "manual", the controller is passive (no auto actions).
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
@@ -30,6 +31,12 @@ logger = get_logger("recording_controller")
 
 GC_TOPIC = "telemetry.game_state"
 DEFAULT_TEAMS_PATH = "config/teams.json"
+
+# Abort an auto recording if the GameController feed goes silent this
+# long (no telemetry.game_state packet). game_state now publishes on
+# every GC packet (a few Hz), so this only trips when the GC is
+# genuinely gone, not during a long PLAYING phase.
+GC_TIMEOUT_S = 60.0
 
 
 class MatchPhase(str, Enum):
@@ -143,14 +150,19 @@ class RecordingController:
         self._running = False
         self._recording_active = False
         self._events_processed = 0
-        self._last_session_key: tuple[int, int, MatchPhase] | None = None
+        # Previous GC state (to detect the INITIAL -> READY start edge)
+        # and the monotonic time of the last GC packet (for the
+        # GC-silence abort watchdog).
+        self._prev_state: str | None = None
+        self._last_packet_time: float | None = None
 
     def _reload_teams(self) -> None:
         """Reload team names from config file."""
         self._team_names = _load_team_names(self._teams_path)
 
-    def _start_recording(self, msg: GameStateMessage, phase: MatchPhase) -> None:
+    def _start_recording(self, msg: GameStateMessage) -> None:
         """Start a recording with auto-generated name from GC data."""
+        phase = derive_match_phase(msg.game_phase, msg.first_half) or MatchPhase.FIRST_HALF
         name = _build_session_name(
             msg.team1_number,
             msg.team2_number,
@@ -164,9 +176,9 @@ class RecordingController:
         except Exception as e:
             logger.error("auto_start_failed", error=str(e))
 
-    def _stop_recording(self) -> None:
+    def _stop_recording(self, *, reason: str = "finished") -> None:
         """Stop the current recording."""
-        logger.info("auto_stop_recording")
+        logger.info("auto_stop_recording", reason=reason)
         try:
             self._media.stop_recording()
             self._recording_active = False
@@ -176,52 +188,43 @@ class RecordingController:
     def _handle_event(self, msg: GameStateMessage) -> None:
         """Process a game state event.
 
-        Recording is keyed by `(team1, team2, MatchPhase)`. We start a
-        new recording only when that key changes; PLAYING → READY → SET
-        → PLAYING within the same half (every goal kickoff in SPL/HSL)
-        keeps the existing recording running.
+        START on the INITIAL -> READY transition; STOP on FINISHED. The
+        per-packet timestamp feeds the GC-silence watchdog in `run`.
         """
         self._events_processed += 1
+        # Heartbeat for the watchdog - updated on every packet, regardless
+        # of mode, so a manual->automatic flip mid-feed times correctly.
+        self._last_packet_time = time.monotonic()
 
-        # Only act in automatic mode
+        state = msg.state.value  # "INITIAL" / "READY" / ... / "FINISHED"
+        prev = self._prev_state
+        self._prev_state = state
+
+        # Only take recording actions in automatic mode.
         if self._get_mode() != "automatic":
             return
 
-        state = msg.state.value  # string like "PLAYING", "FINISHED"
-
-        if state == "FINISHED":
-            if self._recording_active:
-                self._stop_recording()
-            self._last_session_key = None
+        # START: kickoff of a match/half is the INITIAL -> READY edge.
+        # A goal kickoff is PLAYING -> READY, so it does not match.
+        if state == "READY" and prev == "INITIAL" and not self._recording_active:
+            self._reload_teams()
+            self._start_recording(msg)
             return
 
-        if state != "PLAYING":
-            # READY / SET / INITIAL: never start, never stop. Recording
-            # (if any) keeps rolling through the kickoff handshake.
-            return
+        # STOP: "Finish" on the GC.
+        if state == "FINISHED" and self._recording_active:
+            self._stop_recording(reason="finished")
 
-        new_phase = derive_match_phase(msg.game_phase, msg.first_half)
-        if new_phase is None:
-            # TIMEOUT (or unrecognised phase) - do not record.
+    def _check_watchdog(self) -> None:
+        """Abort an auto recording if the GC feed went silent."""
+        if not self._recording_active or self._last_packet_time is None:
             return
-
-        new_key = (msg.team1_number, msg.team2_number, new_phase)
-        if new_key == self._last_session_key:
-            # Same half, same teams - already recording, nothing to do.
-            return
-
-        # Phase change or new match: stop the previous recording, start fresh.
-        # Reload team names so a config edit between halves is picked up.
-        self._reload_teams()
-        if self._recording_active:
-            logger.info(
-                "auto_restart_recording",
-                old=self._last_session_key[2].value if self._last_session_key else None,
-                new=new_phase.value,
-            )
-            self._stop_recording()
-        self._start_recording(msg, new_phase)
-        self._last_session_key = new_key
+        silent = time.monotonic() - self._last_packet_time
+        if silent > GC_TIMEOUT_S:
+            logger.warning("auto_abort_no_gc", silent_s=round(silent, 1))
+            self._stop_recording(reason="gc_timeout")
+            # Allow a fresh INITIAL -> READY to start a new recording.
+            self._prev_state = None
 
     def run(self, timeout_ms: int = 1000) -> int:
         """Run the controller loop. Returns total events processed."""
@@ -238,6 +241,9 @@ class RecordingController:
                     self._handle_event(msg)
                 except Exception as e:
                     logger.warning("event_parse_error", error=str(e))
+            # Runs ~1 Hz (the receive timeout) even when no packets arrive,
+            # so the GC-silence watchdog still fires.
+            self._check_watchdog()
 
         return self._events_processed
 

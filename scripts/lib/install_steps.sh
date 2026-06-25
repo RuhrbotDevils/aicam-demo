@@ -462,6 +462,34 @@ aicam_setup_firewall() {
 }
 
 # ---------------------------------------------------------------------------
+# Field-wifi profile
+# ---------------------------------------------------------------------------
+
+# aicam_setup_field_wifi DEPLOY_PATH USER - install the aicam-wifi
+# sudoers drop-in (so the control_api user can (re)activate the selected
+# profile on config-PUT without a password), then run the applier once
+# so a freshly-deployed / rebooted box reaches the configured wifi
+# state. The applier drives nmcli and re-applies the firewall egress
+# lock; with selected_profile=none it simply ensures wifi is off.
+# Idempotent.
+aicam_setup_field_wifi() {
+    local deploy_path="$1" target_user="$2"
+
+    local sudoers_src="$deploy_path/config/sudoers.d/aicam-wifi"
+    if [ -f "$sudoers_src" ]; then
+        sed -e "s|{{TARGET_USER}}|$target_user|g" \
+            -e "s|{{DEPLOY_PATH}}|$deploy_path|g" \
+            "$sudoers_src" \
+            | sudo tee /etc/sudoers.d/aicam-wifi > /dev/null
+        sudo chmod 0440 /etc/sudoers.d/aicam-wifi
+    fi
+
+    # Reconcile the selected profile via the same applier the control_api
+    # uses at runtime; it re-applies the firewall egress lock too.
+    ( cd "$deploy_path" && sudo "$deploy_path/.venv/bin/python3" scripts/apply_wifi_profile.py )
+}
+
+# ---------------------------------------------------------------------------
 # Desktop / kiosk integration (best-effort; no-ops on a headless box)
 # ---------------------------------------------------------------------------
 

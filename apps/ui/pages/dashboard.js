@@ -192,6 +192,18 @@ const DashboardPage = {
       healthMap = h.services || {};
     } catch { /* health data optional */ }
 
+    // Field-wifi status row (not a systemd service).
+    let wifiRow = '';
+    try {
+      wifiRow = this._wifiRow(await API.get('/wifi/status'));
+    } catch { /* wifi status optional */ }
+
+    // GameController feed liveness row.
+    let gcRow = '';
+    try {
+      gcRow = this._gcRow(await API.get('/gamecontroller/status'));
+    } catch { /* gc status optional */ }
+
     const rows = services.map(s => {
       const badge = this._badge(s.status);
       const inCooldown = this._isInCooldown(s.name);
@@ -220,8 +232,54 @@ const DashboardPage = {
     el.innerHTML = `
       <h2>Services</h2>
       <table><thead><tr><th>Service</th><th>Status</th><th>Health</th><th>Action</th></tr></thead>
-      <tbody>${rows}</tbody></table>
+      <tbody>${rows}${wifiRow}${gcRow}</tbody></table>
     `;
+  },
+
+  // Render the GameController feed-liveness row.
+  _gcRow(g) {
+    let badge;
+    if (g && g.connected) {
+      badge = '<span class="badge badge-ok">connected</span>';
+    } else if (g && g.last_seen_age_s !== null && g.last_seen_age_s !== undefined) {
+      badge = `<span class="badge badge-warn">no packets (${g.last_seen_age_s}s)</span>`;
+    } else {
+      badge = '<span class="badge badge-warn">no packets</span>';
+    }
+    return `<tr><td>GameController</td><td>${badge}</td><td></td><td></td></tr>`;
+  },
+
+  // Render the field-wifi status row for the Services table.
+  _wifiRow(w) {
+    let badge;
+    let action = '';
+    if (!w || !w.selected_profile) {
+      badge = '<span class="badge">no profile selected</span>';
+    } else if (w.connected) {
+      const ip = w.ip ? ` (${w.ip})` : '';
+      badge = `<span class="badge badge-ok" title="${w.interface || ''}">connected: ${w.selected_profile}${ip}</span>`;
+    } else {
+      badge = `<span class="badge badge-warn">not connected (${w.selected_profile})</span>`;
+      const cooling = this._isInCooldown('__wifi__');
+      const disabled = cooling ? ' disabled' : '';
+      const label = cooling ? 'Wait...' : 'Reconnect';
+      action = `<button class="btn btn-sm btn-warning"${disabled}
+        onclick="DashboardPage.reconnectWifi()">${label}</button>`;
+    }
+    return `<tr><td>Field WiFi</td><td>${badge}</td><td></td><td>${action}</td></tr>`;
+  },
+
+  async reconnectWifi() {
+    if (this._isInCooldown('__wifi__')) return;
+    // Association can take a while; cool the button down so repeated
+    // clicks don't queue overlapping applier runs.
+    this._restartCooldowns['__wifi__'] = Date.now() + 10000;
+    try {
+      await API.post('/wifi/reconnect');
+      Notify.success('Reconnecting field WiFi...');
+    } catch (e) {
+      Notify.error(`WiFi reconnect failed: ${e.message}`);
+    }
   },
 
   async restartService(name) {

@@ -184,6 +184,14 @@ pub struct MediaConfig {
     /// via the `layout-sizes-json` GObject property.
     #[serde(default)]
     pub streaming_overlay_layout: Option<aicam_broadcast_overlay::layout::LayoutSizes>,
+
+    /// Operator-configured label for the broadcast overlay's top-left
+    /// field pill. Seeds `overlay_state.field_name` at startup from
+    /// `video.streaming.field_name`; the GameController telemetry
+    /// packets carry no field name, so the subscriber preserves this
+    /// value across game-state updates.
+    #[serde(default = "default_field_name")]
+    pub streaming_field_name: String,
 }
 
 /// Streaming HUD renderer choice. See
@@ -398,6 +406,16 @@ fn load_config() -> MediaConfig {
     {
         cfg.streaming_flow_check_grace_s = grace;
     }
+    // broadcast-overlay field label. Seeds the live overlay state at
+    // startup; a config without the key keeps the default.
+    if let Some(name) = yaml
+        .get("video")
+        .and_then(|v| v.get("streaming"))
+        .and_then(|s| s.get("field_name"))
+        .and_then(|v| v.as_str())
+    {
+        cfg.streaming_field_name = name.to_string();
+    }
     // optional audio-on-stream toggle. Default false because
     // robust_audio_source breaks dynamic-tee dispatch, so
     // flvmux stalls when audio is requested.
@@ -581,6 +599,13 @@ fn default_encoder_quality_qp() -> u32 {
     30
 }
 
+/// Default broadcast-overlay field label. Matches the
+/// `config.example.yaml` default and the historical hardcoded value, so
+/// a config without `video.streaming.field_name` is unchanged.
+fn default_field_name() -> String {
+    "FIELD A".to_string()
+}
+
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
@@ -606,6 +631,7 @@ impl Default for MediaConfig {
             deployment: MediaDeploymentConfig::default(),
             streaming_overlay_renderer: OverlayRenderer::default(),
             streaming_overlay_layout: None,
+            streaming_field_name: default_field_name(),
         }
     }
 }
@@ -900,6 +926,14 @@ async fn main() -> anyhow::Result<()> {
         "Media config loaded"
     );
 
+    // Seed the live overlay's field label from config so the operator's
+    // configured `video.streaming.field_name` survives a restart instead
+    // of resetting to the hardcoded default.
+    let overlay_state = overlay::new_overlay_state();
+    if let Ok(mut overlay) = overlay_state.write() {
+        overlay.field_name = config.streaming_field_name.clone();
+    }
+
     let state = AppState {
         status: Arc::new(RwLock::new(initial_status)),
         config: Arc::new(RwLock::new(config)),
@@ -912,7 +946,7 @@ async fn main() -> anyhow::Result<()> {
         recording_session: Arc::new(RwLock::new(None)),
         object_detection_preview_buffer:
             object_detection_preview::new_object_detection_preview_buffer(),
-        overlay_state: overlay::new_overlay_state(),
+        overlay_state,
         ai_config_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         replay_state: Arc::new(RwLock::new(ReplayState::default())),
     };

@@ -7,7 +7,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class NodeRole(str, Enum):
@@ -96,6 +96,30 @@ class FieldWifiConfig(BaseModel):
     interface: str = "wlan0"
     listen_only: bool = True
     profiles: list[WifiProfile] = Field(default_factory=list)
+    # name of the active field-wifi profile, or None / "none" for
+    # "wifi switched off". The control_api activates the selected
+    # profile on the Pi (nmcli) when this changes; the firewall locks
+    # the wifi interface to receive-only while a profile is active.
+    selected_profile: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_selected_profile(self) -> FieldWifiConfig:
+        """Reset an unrecognised selection to None (wifi off).
+
+        Guards against a stale or hand-edited `selected_profile` that
+        names a profile no longer present - the camera then simply
+        leaves the field wifi off rather than failing config load.
+        The literal "none" (any case) is normalised to None.
+        """
+        sel = self.selected_profile
+        if sel is None:
+            return self
+        if sel.strip().lower() == "none":
+            self.selected_profile = None
+            return self
+        if sel not in {p.name for p in self.profiles}:
+            self.selected_profile = None
+        return self
 
 
 class FirewallConfig(BaseModel):
@@ -195,6 +219,13 @@ class StreamingConfig(BaseModel):
     # bitrate higher than recommended" warning out of the box. Users
     # can bump this in the Config page if their upstream link allows.
     bitrate_kbps: int = 2500
+    # Operator-set label shown in the broadcast overlay's top-left pill
+    # (e.g. "FIELD A"). Persisted here so it survives a media-service
+    # restart - the media service seeds its live overlay state from this
+    # value at startup. The Streaming page's "Update Field Name" control
+    # still edits the same value live for the current session; saving it
+    # here makes the choice permanent.
+    field_name: str = "FIELD A"
     # Grace period before the media service's streaming
     # flow-check concludes no buffers reached rtmpsink. Default 10 s
     # covers libcamera + ALSA + flvmux warmup on Pi 5 at 1080p with

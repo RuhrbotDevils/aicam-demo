@@ -210,6 +210,17 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
+# Step 10b - Field-wifi profile (needs venv + config.yaml + firewall above)
+# ---------------------------------------------------------------------------
+echo "--- Step 10b: Field-wifi profile ---"
+if aicam_setup_field_wifi "$DEPLOY_PATH" "$TARGET_USER"; then
+    aicam_step_done "Field-wifi profile reconciled (nmcli + egress lock) + sudoers drop-in installed"
+else
+    aicam_step_fail "Field-wifi setup failed - re-run scripts/apply_wifi_profile.py"
+fi
+echo ""
+
+# ---------------------------------------------------------------------------
 # Step 11 - Kiosk autostart (desktop only; no-op when headless)
 # ---------------------------------------------------------------------------
 echo "--- Step 11: Kiosk autostart ---"

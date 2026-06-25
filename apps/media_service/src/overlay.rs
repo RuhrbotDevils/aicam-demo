@@ -341,6 +341,19 @@ pub fn team_colour_byte_to_rgb(byte: u32) -> Option<(f64, f64, f64)> {
 // ZMQ subscriber
 // ---------------------------------------------------------------------------
 
+/// Merge a freshly-parsed game state into the existing overlay,
+/// preserving the fields the GameController packet does not carry:
+/// the per-robot penalty cards (their own publisher cadence, updated
+/// by the `telemetry.penalties` branch) and the operator-configured
+/// field name (seeded from `video.streaming.field_name` at startup,
+/// live-editable via `PUT /overlay/text`).
+fn apply_game_state(overlay: &mut GameOverlayData, mut data: GameOverlayData) {
+    data.team1_penalties = std::mem::take(&mut overlay.team1_penalties);
+    data.team2_penalties = std::mem::take(&mut overlay.team2_penalties);
+    data.field_name = std::mem::take(&mut overlay.field_name);
+    *overlay = data;
+}
+
 /// Start a background ZMQ subscriber that listens for game state and
 /// penalty updates and populates the structured overlay data.
 ///
@@ -385,15 +398,9 @@ pub fn start_overlay_subscriber(state: OverlayState, zmq_endpoint: &str, teams: 
 
             match topic.as_str() {
                 "telemetry.game_state" => {
-                    let mut data = parse_game_state(&json, &teams);
+                    let data = parse_game_state(&json, &teams);
                     if let Ok(mut overlay) = state.write() {
-                        // Preserve penalty cards across the game-state
-                        // overwrite - penalties have their own publisher
-                        // cadence and are updated by the penalties branch
-                        // below.
-                        data.team1_penalties = std::mem::take(&mut overlay.team1_penalties);
-                        data.team2_penalties = std::mem::take(&mut overlay.team2_penalties);
-                        *overlay = data;
+                        apply_game_state(&mut overlay, data);
                     }
                 }
                 "telemetry.penalties" => {
@@ -2261,6 +2268,42 @@ mod tests {
         assert_eq!((home_rgba.r, home_rgba.g, home_rgba.b), (255, 0, 0));
         let away_rgba = s.away_team_color.expect("away color present");
         assert_eq!((away_rgba.r, away_rgba.g, away_rgba.b), (0, 0, 255));
+    }
+
+    #[test]
+    fn apply_game_state_preserves_configured_field_name() {
+        // The configured/seeded value lives in the existing overlay;
+        // a GC packet parses to the placeholder "FIELD A". After the
+        // merge the operator's value must survive.
+        let mut overlay = GameOverlayData {
+            field_name: "FIELD C".into(),
+            team1_score: 0,
+            ..GameOverlayData::default()
+        };
+        let incoming = GameOverlayData {
+            field_name: "FIELD A".into(), // parse_game_state placeholder
+            team1_score: 2,
+            ..GameOverlayData::default()
+        };
+        apply_game_state(&mut overlay, incoming);
+        // Field name preserved; live game data still applied.
+        assert_eq!(overlay.field_name, "FIELD C");
+        assert_eq!(overlay.team1_score, 2);
+    }
+
+    #[test]
+    fn apply_game_state_preserves_penalty_cards() {
+        let mut overlay = GameOverlayData {
+            team1_penalties: vec![PenaltyCard {
+                player_number: 3,
+                penalty_reason: "Pushing".into(),
+                secs_remaining: 30,
+            }],
+            ..GameOverlayData::default()
+        };
+        let incoming = GameOverlayData::default();
+        apply_game_state(&mut overlay, incoming);
+        assert_eq!(overlay.team1_penalties.len(), 1);
     }
 
     #[test]

@@ -1,0 +1,13 @@
+# Allow the control_api user to activate the selected field-wifi
+# profile on config-PUT without a password prompt.
+#
+# The applier (apply_wifi_profile.py) drives nmcli to (re)create and
+# bring up the dedicated `aicam-field` NetworkManager connection (or
+# turn the radio off), then re-applies the firewall egress lock.
+# {{TARGET_USER}} is substituted by the setup script - only that user
+# gets the grant, and only for this exact script path plus the nmcli
+# binary it shells out to. Installed by the deploy scripts as
+# /etc/sudoers.d/aicam-wifi.
+{{TARGET_USER}} ALL=(root) NOPASSWD: {{DEPLOY_PATH}}/.venv/bin/python {{DEPLOY_PATH}}/scripts/apply_wifi_profile.py
+{{TARGET_USER}} ALL=(root) NOPASSWD: /usr/bin/python3 {{DEPLOY_PATH}}/scripts/apply_wifi_profile.py
+{{TARGET_USER}} ALL=(root) NOPASSWD: /usr/bin/nmcli

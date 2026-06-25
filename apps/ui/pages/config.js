@@ -75,7 +75,9 @@ const ConfigPage = {
         this._field('video.streaming.rtmp_url', 'RTMP URL', this._config.video.streaming.rtmp_url || '', 'text'),
         this._field('video.streaming.stream_key', 'Stream Key', this._config.video.streaming.stream_key || '', 'password'),
         this._field('video.streaming.bitrate_kbps', 'Bitrate (kbps)', this._config.video.streaming.bitrate_kbps || 2500, 'number'),
+        this._field('video.streaming.field_name', 'Field Name (overlay)', this._config.video.streaming.field_name || 'FIELD A', 'text'),
       ])}
+      ${this._wifiSection()}
       ${this._section('AI', [
         this._field('ai.accelerator', 'Accelerator', this._config.ai.accelerator, 'text'),
       ])}
@@ -148,6 +150,23 @@ const ConfigPage = {
         'GC Test Mode (synthetic packets at 1 Hz when no live GC)',
         !!t.gc_test_mode,
       ),
+    ]);
+  },
+
+  /**
+   * Field-wifi selector. Dropdown of "none" (wifi off) plus every
+   * configured profile name. On save the control_api activates the
+   * selected profile on the Pi (nmcli) and locks the wifi interface
+   * to receive-only via the firewall. Overlay/GameController data
+   * still arrives over the field link; the camera only receives.
+   */
+  _wifiSection() {
+    const fw = (this._config.network && this._config.network.field_wifi) || {};
+    const names = (fw.profiles || []).map(p => p.name);
+    const options = ['none', ...names];
+    const selected = fw.selected_profile || 'none';
+    return this._section('Wifi', [
+      this._select('network.field_wifi.selected_profile', 'Field Network', selected, options),
     ]);
   },
 

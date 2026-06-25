@@ -42,6 +42,14 @@ GC_PENALTIES_TOPIC = "telemetry.penalties"
 # we adopt a newer GC release and re-validate offsets.
 EXPECTED_VERSION = 20
 
+# RoboCupGameControlData uses a FIXED-size player array per team
+# (`struct RobotInfo players[MAX_NUM_PLAYERS]`), not a playersPerTeam-
+# sized one. The whole array is always on the wire, so the stride from
+# teams[0] to teams[1] is constant regardless of how many players a
+# league actually fields. Getting this wrong shifts team2 (and the
+# penalty blocks) into team1's player array.
+MAX_NUM_PLAYERS = 20
+
 
 class PenaltyCode(IntEnum):
     """RobotInfo penalty byte values from the HSL v20 spec.
@@ -228,11 +236,16 @@ class GameControllerListener:
         # HSL TeamInfo (v20): teamNumber(1) + fieldPlayerColour(1) +
         #               goalkeeperColour(1) + goalkeeper(1) + score(1) +
         #               penaltyShot(1) + singleShots(2) + messageBudget(2) +
-        #               RobotInfo[playersPerTeam] (3 bytes each).
-        # Total per team = 10 + players_per_team * 3.
+        #               RobotInfo[MAX_NUM_PLAYERS] (3 bytes each).
+        # The player array is FIXED at MAX_NUM_PLAYERS (not
+        # players_per_team), so the per-team stride is constant:
+        # 10 + 20 * 3 = 70 bytes. The full packet is 18 + 2 * 70 = 158
+        # bytes. (Using players_per_team here shifts team2 into team1's
+        # player array - the v20 mis-parse that returned score=0 /
+        # messageBudget=3328 for team2.)
         team1_offset = 18
         team1_info = self._parse_team_info(data, team1_offset)
-        team_info_size = 10 + players_per_team * 3
+        team_info_size = 10 + MAX_NUM_PLAYERS * 3
         team2_offset = team1_offset + team_info_size
         team2_info = self._parse_team_info(data, team2_offset)
 
@@ -447,15 +460,24 @@ class GameControllerListener:
                 # (~1 KB at most) so the ~10 Hz cadence is fine.
                 self._publish_penalties(parsed)
 
-                # Only publish game_state on state changes (avoid
-                # flooding). Penalty data above publishes every cycle.
+                # Publish game_state on EVERY packet. It carries
+                # time-varying fields (secs_remaining clock, secondary_time,
+                # scores) that the overlay must render smoothly - gating on
+                # state change froze the clock between transitions and only
+                # jumped when the state finally changed. Publishing every
+                # cycle also gives downstream consumers (the recording
+                # controller's GC-alive watchdog) a per-packet heartbeat.
+                # The payload is small and the GC cadence is only a few Hz.
+                self._publish_event(parsed)
+
+                # Log state transitions (info-level signal), but the
+                # publish above is unconditional.
                 if new_state != self._last_state:
                     logger.info(
                         "state_changed",
                         old=self._last_state.name if self._last_state else "none",
                         new=new_state.name,
                     )
-                    self._publish_event(parsed)
                     self._last_state = new_state
 
             except TimeoutError:

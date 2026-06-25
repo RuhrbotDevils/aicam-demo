@@ -28,6 +28,10 @@ network:
   field_wifi:
     interface: wlan0
     listen_only: true
+    # name of the active profile below, or `none` (wifi off).
+    # Selecting one in the Config UI activates it on the Pi (nmcli) and
+    # locks the wifi interface to receive-only via the firewall.
+    selected_profile: none
     profiles: []
   # Inbound firewall (nftables). Comma-separated CIDR allowlist for
   # SSH (TCP 22) + web UI (TCP 8000). All other inbound ports are
@@ -138,6 +142,10 @@ video:
     stream_key: ''
     # 720p15 default tuned for YouTube.
     bitrate_kbps: 2500
+    # Label shown in the broadcast overlay's top-left pill. Seeds the
+    # live overlay at media-service startup; editable live from the
+    # Streaming page and persistently from the Configuration page.
+    field_name: FIELD A
     flow_check_grace_s: 10
     # Streaming HUD renderer.
     #   - `nv12_native` (default) - `aicamnv12overlay` writes the

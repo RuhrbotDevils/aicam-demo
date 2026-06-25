@@ -85,6 +85,34 @@ def _read_allowed_ip_ranges(config_path: Path) -> str:
     return ((data.get("network") or {}).get("firewall") or {}).get("allowed_ip_ranges") or "*"
 
 
+def _read_wifi_lock_iface(config_path: Path) -> str | None:
+    """The field-wifi interface to lock to receive-only.
+
+    Returns `network.field_wifi.interface` when a real profile is
+    selected (`selected_profile` names one of `profiles`), else None
+    (no lock - wifi is off / unselected). Best-effort: any read error
+    leaves the lock off, never fail-closed in a way that could brick
+    a misconfigured box's egress.
+    """
+    try:
+        import yaml
+
+        with config_path.open("r") as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, ImportError) as e:
+        logger.warning("Could not read %s (%s) - wifi egress lock off", config_path, e)
+        return None
+    fw = (data.get("network") or {}).get("field_wifi") or {}
+    selected = fw.get("selected_profile")
+    if not selected or str(selected).strip().lower() == "none":
+        return None
+    names = {p.get("name") for p in (fw.get("profiles") or []) if isinstance(p, dict)}
+    if selected not in names:
+        logger.warning("field_wifi.selected_profile=%r not in profiles - egress lock off", selected)
+        return None
+    return fw.get("interface") or "wlan0"
+
+
 def _discover_local_subnets() -> tuple[list[str], list[str]]:
     """The camera's directly-connected (on-link) subnets.
 
@@ -186,7 +214,10 @@ def main(argv: list[str] | None = None) -> int:
         logger.info(
             "GameController (3838) allowed from local nets: v4=%s v6=%s", local_v4, local_v6
         )
-    v4_rules, v6_rules = render_from_config(raw, local_v4, local_v6)
+    wifi_lock_iface = _read_wifi_lock_iface(args.config)
+    if wifi_lock_iface:
+        logger.info("Field-wifi active - locking %s to receive-only egress", wifi_lock_iface)
+    v4_rules, v6_rules = render_from_config(raw, local_v4, local_v6, wifi_lock_iface)
 
     if args.dry_run:
         sys.stdout.write("# ===== IPv4 (iptables-restore) =====\n")
